@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Página Streamlit para processar "Comparativo geral.xlsx" e exibir dashboards
-interativos com formatação de moeda brasileira e gráficos compactos.
+interativos com formatação de moeda brasileira e controle de escala no eixo Y.
 
 Como rodar:
   pip install streamlit pandas numpy plotly openpyxl
@@ -152,6 +152,15 @@ year_sel = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_min, month_max = (min(month_opts) if month_opts else 1, max(month_opts) if month_opts else 12)
 month_range = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
+# NOVO: seletor de escala para o eixo Y
+scale_name = st.sidebar.selectbox("Escala do eixo Y", ["Reais (R$)", "Mil (R$ mil)", "Milhões (R$ mi)"], index=0)
+scale_map = {
+    "Reais (R$)": (1.0, "R$"),
+    "Mil (R$ mil)": (1e3, "R$ mil"),
+    "Milhões (R$ mi)": (1e6, "R$ mi"),
+}
+scale_div, scale_label = scale_map[scale_name]
+
 mask = (
     fact["secretaria"].isin(sec_sel) &
     fact["category"].isin(cat_sel) &
@@ -159,6 +168,7 @@ mask = (
     fact["date"].dt.month.between(month_range[0], month_range[1])
 )
 filt = fact.loc[mask].copy()
+filt["value_scaled"] = filt["value"] / scale_div  # usado apenas para o eixo Y
 
 # ------------------ KPIs ------------------
 kpi_2024 = filt.loc[filt["year"] == 2024, "value"].sum()
@@ -174,33 +184,38 @@ c4.metric("Variação (%)", br_percent(kpi_var_pct) if pd.notna(kpi_var_pct) els
 
 st.markdown("---")
 
-# ------------------ Gráficos ------------------
-# parâmetros comuns de layout para gráficos compactos
+# ------------------ Funções de gráfico ------------------
 def compact_layout(fig):
+    # Impede abreviação (k, M), força separadores BR e prefixo R$
     fig.update_layout(
         height=300,
         margin=dict(l=20, r=20, t=40, b=20),
-        hovermode="x unified"
+        hovermode="x unified",
+        separators=",.",  # decimal=',' milhares='.'
+        yaxis_tickformat=",.2f",
+        yaxis_tickprefix="R$ "
     )
     return fig
 
+def label_value():
+    return f"Valor ({scale_label})" if scale_label != "R$" else "Valor (R$)"
+
 tab1, tab2, tab3, tab4 = st.tabs(["Evolução Mensal", "Por Secretaria", "Por Categoria", "Tabela Comparativa"])
 
+# ------------------ Evolução Mensal ------------------
 with tab1:
     if not filt.empty:
         evo = (
             filt.assign(month=lambda d: d["date"].dt.month)
-                .groupby(["year", "month"], as_index=False)["value"].sum()
+                .groupby(["year", "month"], as_index=False)[["value", "value_scaled"]].sum()
                 .sort_values(["year", "month"])
         )
-        # Hover em BRL
-        evo["valor_br"] = evo["value"].apply(br_currency)
+        evo["valor_br"] = evo["value"].apply(br_currency)  # hover em R$
         fig = px.line(
-            evo, x="month", y="value", color="year", markers=True,
-            labels={"value": "Valor", "month": "Mês", "year": "Ano"},
+            evo, x="month", y="value_scaled", color="year", markers=True,
+            labels={"value_scaled": label_value(), "month": "Mês", "year": "Ano"},
             title="Evolução Mensal (Soma dos Filtros)"
         )
-        # customdata para hover em BR
         fig.update_traces(
             customdata=np.stack([evo["valor_br"]], axis=-1),
             hovertemplate="Valor: %{customdata[0]}<extra></extra>"
@@ -209,13 +224,14 @@ with tab1:
     else:
         st.info("Sem dados para os filtros selecionados.")
 
+# ------------------ Por Secretaria ------------------
 with tab2:
     if not filt.empty:
-        by_sec = filt.groupby(["year", "secretaria"], as_index=False)["value"].sum()
+        by_sec = filt.groupby(["year", "secretaria"], as_index=False)[["value", "value_scaled"]].sum()
         by_sec["valor_br"] = by_sec["value"].apply(br_currency)
         fig2 = px.bar(
-            by_sec, x="secretaria", y="value", color="year", barmode="group",
-            labels={"value": "Valor", "secretaria": "Secretaria", "year": "Ano"},
+            by_sec, x="secretaria", y="value_scaled", color="year", barmode="group",
+            labels={"value_scaled": label_value(), "secretaria": "Secretaria", "year": "Ano"},
             title="Soma por Secretaria"
         )
         fig2.update_traces(
@@ -226,13 +242,14 @@ with tab2:
     else:
         st.info("Sem dados para os filtros selecionados.")
 
+# ------------------ Por Categoria ------------------
 with tab3:
     if not filt.empty:
-        by_cat = filt.groupby(["year", "category"], as_index=False)["value"].sum()
+        by_cat = filt.groupby(["year", "category"], as_index=False)[["value", "value_scaled"]].sum()
         by_cat["valor_br"] = by_cat["value"].apply(br_currency)
         fig3 = px.bar(
-            by_cat, x="category", y="value", color="year", barmode="group",
-            labels={"value": "Valor", "category": "Categoria", "year": "Ano"},
+            by_cat, x="category", y="value_scaled", color="year", barmode="group",
+            labels={"value_scaled": label_value(), "category": "Categoria", "year": "Ano"},
             title="Soma por Categoria"
         )
         fig3.update_traces(
@@ -243,8 +260,8 @@ with tab3:
     else:
         st.info("Sem dados para os filtros selecionados.")
 
+# ------------------ Tabela Comparativa ------------------
 with tab4:
-    # Tabela comparativa 2024 vs 2025 (por Secretaria × Categoria × Mês)
     comp_filt = comp[
         (comp["secretaria"].isin(sec_sel)) &
         (comp["category"].isin(cat_sel)) &
@@ -274,4 +291,4 @@ with tab4:
     )
 
 st.markdown("---")
-st.caption("Dica: ajuste os filtros na lateral para refinar os indicadores e gráficos. KPIs, tabela e hovers usam moeda em formato brasileiro.")
+st.caption("Dica: KPIs e hovers sempre mostram valores reais em R$. Use o seletor de escala para adequar o eixo Y.")
