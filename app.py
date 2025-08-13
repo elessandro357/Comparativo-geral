@@ -3,10 +3,6 @@
 """
 Painel Streamlit para processar "Comparativo geral.xlsx" e exibir dashboards
 por secretaria (evolução, variações, heatmap e detalhe), com formatação BR.
-
-Como rodar:
-  pip install streamlit pandas numpy plotly openpyxl
-  streamlit run app.py
 """
 import io
 import numpy as np
@@ -15,15 +11,32 @@ import streamlit as st
 import plotly.express as px
 from datetime import datetime
 
-# ================== Config geral ==================
+# ================== Config ==================
 st.set_page_config(page_title="Folha - Comparativo 2024 x 2025", layout="wide")
 st.title("📊 Painel de Folha (2024 x 2025)")
-st.caption("Envie o arquivo **Comparativo geral.xlsx** para explorar por secretaria, com evolução, variações e heatmap.")
+st.caption("Envie o arquivo **Comparativo geral.xlsx**. Se algo quebrar, o app mostra o motivo e onde corrigir.")
+
+# --- CSS: reduzir tamanho dos números dos KPIs (sem cortar conteúdo) ---
+st.markdown(
+    """
+    <style>
+      /* cartão do KPI */
+      div[data-testid="stMetric"] { padding: 0.25rem 0.5rem; }
+      /* rótulo menor */
+      div[data-testid="stMetric"] [data-testid="stMetricLabel"] { font-size: 0.85rem; }
+      /* valor menor (ajuste aqui se quiser ainda menor/maior) */
+      div[data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.6rem; }
+      /* seta do delta menor */
+      div[data-testid="stMetric"] [data-testid="stMetricDelta"] svg { transform: scale(0.85); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ================== Helpers ==================
 PT_MONTHS = {"Jan":1,"Fev":2,"Mar":3,"Abr":4,"Mai":5,"Jun":6,"Jul":7,"Ago":8,"Set":9,"Out":10,"Nov":11,"Dez":12}
 MONTH_ABBR = {v:k for k,v in PT_MONTHS.items()}
-CATEGORIES = ["Agente Político", "Eletivo", "Comissionado", "Contratado", "Efetivo", "Total"]
+CATEGORIES = ["Agente Político","Eletivo","Comissionado","Contratado","Efetivo","Total"]
 
 def extract_month(m):
     try:
@@ -36,93 +49,116 @@ def br_currency(x):
     try:
         return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        return x
+        return str(x)
 
 def br_percent(x):
     try:
         return f"{float(x)*100:,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        return x
+        return str(x)
 
 def month_label(m:int) -> str:
-    return MONTH_ABBR.get(int(m), str(m))
+    try:
+        return MONTH_ABBR.get(int(m), str(m))
+    except Exception:
+        return str(m)
 
+def safe_selectbox(label, options, default_first=True, key=None):
+    if not options:
+        st.warning(f"Não há opções para '{label}'. Verifique os filtros/dados.")
+        return None
+    idx = 0 if default_first else 0
+    return st.selectbox(label, options=options, index=idx, key=key)
+
+# ================== Transform ==================
 @st.cache_data(show_spinner=False)
 def transform_excel(file_bytes: bytes):
-    # Lê a primeira planilha
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0)
-    # Normaliza nomes de colunas
-    df.columns = df.columns.str.strip()
-    # Detecta a coluna de secretaria de forma robusta
+    df.columns = df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
+
+    # Detecta Secretaria
     sec_col = next((c for c in df.columns if c.lower().startswith("secretaria")), None)
-    if sec_col is None or "Mês/Ano" not in df.columns:
-        raise ValueError("Planilha precisa conter as colunas 'Secretaria' e 'Mês/Ano'.")
 
-    # Prepara base
+    # Detecta Mês/Ano
+    mes_col = None
+    for c in df.columns:
+        if c.replace(" ", "") in {"Mês/Ano","Mes/Ano"}:
+            mes_col = c; break
+    if mes_col is None:
+        for alt in ["Mês/Ano","Mes/Ano","Mes/Ano "]:
+            if alt in df.columns: mes_col = alt; break
+
+    if sec_col is None or mes_col is None:
+        raise ValueError("Planilha precisa ter colunas 'Secretaria' e 'Mês/Ano' (nomes podem ter espaços).")
+
     df[sec_col] = df[sec_col].ffill()
-    df = df[df["Mês/Ano"].notna()].copy()
-    df["MesIndex"] = df["Mês/Ano"].apply(extract_month)
+    df = df[df[mes_col].notna()].copy()
+    df["MesIndex"] = df[mes_col].apply(extract_month)
 
-    # Mapeia colunas 2024/2025 (robusto a espaços)
+    def find_col(name):
+        if name in df.columns: 
+            return name
+        target = name.lower().replace(" ", "")
+        for c in df.columns:
+            if c.lower().replace(" ", "") == target:
+                return c
+        return None
+
     base_2024 = {
-        "Agente Político": "Agente Político 2024",
-        "Eletivo": "Eletivo 2024",
-        "Comissionado": "Comissionado 2024",
-        "Contratado": "Contratado 2024",
-        "Efetivo": "Efetivo 2024",
-        "Total": "Total 2024",
+        "Agente Político": find_col("Agente Político 2024"),
+        "Eletivo":         find_col("Eletivo 2024"),
+        "Comissionado":    find_col("Comissionado 2024"),
+        "Contratado":      find_col("Contratado 2024"),
+        "Efetivo":         find_col("Efetivo 2024"),
+        "Total":           find_col("Total 2024"),
     }
-    base_2025 = {k: v.replace("2024", "2025") for k, v in base_2024.items()}
+    base_2025 = {
+        "Agente Político": find_col("Agente Político 2025"),
+        "Eletivo":         find_col("Eletivo 2025"),
+        "Comissionado":    find_col("Comissionado 2025"),
+        "Contratado":      find_col("Contratado 2025"),
+        "Efetivo":         find_col("Efetivo 2025"),
+        "Total":           find_col("Total 2025"),
+    }
 
-    # Tabela fato
+    if base_2024["Total"] is None or base_2025["Total"] is None:
+        faltantes = [k for k in ["Total 2024","Total 2025"] if find_col(k) is None]
+        raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(faltantes)}.")
+
     rows = []
-    for _, row in df.iterrows():
-        mes = row["MesIndex"]
-        if pd.isna(mes): 
+    for _, r in df.iterrows():
+        m = r["MesIndex"]
+        if pd.isna(m): 
             continue
         for cat in CATEGORIES:
-            v24 = row.get(base_2024[cat], np.nan)
-            v25 = row.get(base_2025[cat], np.nan)
+            c24 = base_2024.get(cat); c25 = base_2025.get(cat)
+            v24 = float(r[c24]) if (c24 and pd.notna(r.get(c24))) else np.nan
+            v25 = float(r[c25]) if (c25 and pd.notna(r.get(c25))) else np.nan
             if pd.notna(v24):
-                rows.append({
-                    "secretaria": str(row[sec_col]).strip(),
-                    "date": datetime(2024, int(mes), 1),
-                    "year": 2024,
-                    "category": cat,
-                    "value": float(v24)
-                })
+                rows.append({"secretaria": str(r[sec_col]).strip(), "date": datetime(2024,int(m),1),
+                             "year": 2024, "category": cat, "value": v24})
             if pd.notna(v25):
-                rows.append({
-                    "secretaria": str(row[sec_col]).strip(),
-                    "date": datetime(2025, int(mes), 1),
-                    "year": 2025,
-                    "category": cat,
-                    "value": float(v25)
-                })
+                rows.append({"secretaria": str(r[sec_col]).strip(), "date": datetime(2025,int(m),1),
+                             "year": 2025, "category": cat, "value": v25})
 
-    fact = pd.DataFrame(rows).dropna(subset=["date"])
+    fact = pd.DataFrame(rows)
+    if fact.empty:
+        raise ValueError("Após leitura, não há linhas com valores. Confirme os nomes das colunas e meses.")
+
     fact["category"] = pd.Categorical(fact["category"], categories=CATEGORIES, ordered=True)
 
-    # Dimensões auxiliares
-    dim_date = (
-        fact[["date"]].drop_duplicates().assign(
-            year=lambda d: d["date"].dt.year,
-            month=lambda d: d["date"].dt.month
-        ).sort_values("date")
-    )
+    dim_date = (fact[["date"]].drop_duplicates()
+                .assign(year=lambda d: d["date"].dt.year, month=lambda d: d["date"].dt.month)
+                .sort_values("date"))
     dim_secretaria = fact[["secretaria"]].drop_duplicates().sort_values("secretaria")
 
-    # Comparativo 2024 x 2025 por (secretaria, date, category)
-    comp = (
-        fact.pivot_table(index=["secretaria","date","category"], columns="year", values="value", aggfunc="sum")
-            .reset_index().rename_axis(None, axis=1)
-            .rename(columns={2024:"value_2024", 2025:"value_2025"})
-    )
-    # Variações robustas (base 0 trata valores ausentes)
+    comp = (fact.pivot_table(index=["secretaria","date","category"], columns="year", values="value", aggfunc="sum")
+                 .reset_index().rename_axis(None, axis=1)
+                 .rename(columns={2024:"value_2024", 2025:"value_2025"}))
     comp["value_2024_f"] = comp["value_2024"].fillna(0.0)
     comp["value_2025_f"] = comp["value_2025"].fillna(0.0)
     comp["var_abs"] = comp["value_2025_f"] - comp["value_2024_f"]
-    comp["var_pct"] = np.where(comp["value_2024_f"] == 0, np.nan, comp["var_abs"] / comp["value_2024_f"])
+    comp["var_pct"] = np.where(comp["value_2024_f"] == 0, np.nan, comp["var_abs"]/comp["value_2024_f"])
     comp["year"] = comp["date"].dt.year
     comp["month"] = comp["date"].dt.month
 
@@ -131,10 +167,10 @@ def transform_excel(file_bytes: bytes):
 # ================== Upload ==================
 uploaded = st.file_uploader("Envie o arquivo Excel (Comparativo geral.xlsx)", type=["xlsx"])
 if not uploaded:
-    st.info("Envie a planilha para liberar filtros e dashboards.")
+    st.info("Envie a planilha para liberar filtros e gráficos.")
     st.stop()
 
-# ================== Transform ==================
+# ================== Processa ==================
 try:
     fact, dim_date, dim_secretaria, comp = transform_excel(uploaded.getvalue())
 except Exception as e:
@@ -147,19 +183,17 @@ sec_opts = sorted(dim_secretaria["secretaria"].unique().tolist())
 cat_opts = CATEGORIES
 year_opts = sorted(fact["year"].unique().tolist())
 month_opts = sorted(dim_date["month"].unique().tolist())
-month_min, month_max = (min(month_opts) if month_opts else 1, max(month_opts) if month_opts else 12)
+month_min, month_max = (min(month_opts), max(month_opts))
 
-sec_sel = st.sidebar.multiselect("Secretaria (para soma/visões gerais)", sec_opts, default=sec_opts)
+sec_sel = st.sidebar.multiselect("Secretaria (para visões gerais)", sec_opts, default=sec_opts)
 cat_sel = st.sidebar.multiselect("Categoria", cat_opts, default=cat_opts)
 year_sel = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_range = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
-# Escala do eixo Y
 scale_name = st.sidebar.selectbox("Escala do eixo Y", ["Reais (R$)", "Mil (R$ mil)", "Milhões (R$ mi)"], index=0)
 scale_map = {"Reais (R$)":(1.0,"R$"), "Mil (R$ mil)":(1e3,"R$ mil"), "Milhões (R$ mi)":(1e6,"R$ mi")}
 scale_div, scale_label = scale_map[scale_name]
 
-# Filtro base (para KPIs e visões gerais)
 mask = (
     fact["secretaria"].isin(sec_sel) &
     fact["category"].isin(cat_sel) &
@@ -169,7 +203,7 @@ mask = (
 filt = fact.loc[mask].copy()
 filt["value_scaled"] = filt["value"] / scale_div
 
-# ================== KPIs gerais ==================
+# ================== KPIs ==================
 kpi_2024 = filt.loc[filt["year"] == 2024, "value"].sum()
 kpi_2025 = filt.loc[filt["year"] == 2025, "value"].sum()
 kpi_var_abs = kpi_2025 - kpi_2024
@@ -183,22 +217,20 @@ c4.metric("Variação (%)", br_percent(kpi_var_pct) if pd.notna(kpi_var_pct) els
 
 st.markdown("---")
 
-# ================== Funções de gráfico ==================
-def compact_layout(fig, height=300):
+# ================== Layout base ==================
+def compact_layout(fig, height=320):
     fig.update_layout(
         height=height,
         margin=dict(l=20, r=20, t=40, b=20),
         hovermode="x unified",
-        separators=",.",  # decimal=',' milhares='.'
-        yaxis_tickformat=",.2f",
-        yaxis_tickprefix="R$ " if "mi" not in scale_label and "mil" not in scale_label else ""
+        separators=",.",
+        yaxis_tickformat=",.2f"
     )
     return fig
 
 def label_value():
     return f"Valor ({scale_label})" if scale_label != "R$" else "Valor (R$)"
 
-# ================== Abas ==================
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Evolução Mensal (Geral)", 
     "Por Secretaria (Soma)", 
@@ -208,32 +240,32 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Detalhe da Secretaria"
 ])
 
-# ---------- Tab 1: Evolução Mensal (Geral) ----------
+# ---------- Tab 1 ----------
 with tab1:
-    if not filt.empty:
-        evo = (
-            filt.assign(month=lambda d: d["date"].dt.month)
-                .groupby(["year","month"], as_index=False)[["value","value_scaled"]].sum()
-                .sort_values(["year","month"])
-        )
+    st.caption("Mostra a evolução mensal somada do que estiver filtrado. Cada linha é um ano. Subida = aumento de gasto; queda = redução.")
+    if filt.empty:
+        st.info("Sem dados para os filtros selecionados.")
+    else:
+        evo = (filt.assign(month=lambda d: d["date"].dt.month)
+                    .groupby(["year","month"], as_index=False)[["value","value_scaled"]].sum()
+                    .sort_values(["year","month"]))
         evo["valor_br"] = evo["value"].apply(br_currency)
-        evo["Mês"] = evo["month"].apply(lambda m: f"{month_label(m)}")
+        evo["Mês"] = evo["month"].apply(month_label)
         fig = px.line(
             evo, x="Mês", y="value_scaled", color="year", markers=True,
             labels={"value_scaled": label_value(), "Mês": "Mês", "year": "Ano"},
             title="Evolução Mensal (Soma dos filtros)"
         )
-        fig.update_traces(
-            customdata=np.stack([evo["valor_br"]], axis=-1),
-            hovertemplate="Valor: %{customdata[0]}<extra></extra>"
-        )
-        st.plotly_chart(compact_layout(fig), use_container_width=True)
-    else:
-        st.info("Sem dados para os filtros selecionados.")
+        fig.update_traces(customdata=np.stack([evo["valor_br"]], axis=-1),
+                          hovertemplate="Valor: %{customdata[0]}<extra></extra>")
+        st.plotly_chart(compact_layout(fig, 340), use_container_width=True)
 
-# ---------- Tab 2: Por Secretaria (Soma) ----------
+# ---------- Tab 2 ----------
 with tab2:
-    if not filt.empty:
+    st.caption("Compara o total do período filtrado por secretaria. Útil para ver quem mais pesa na folha dentro do recorte.")
+    if filt.empty:
+        st.info("Sem dados para os filtros selecionados.")
+    else:
         by_sec = filt.groupby(["year","secretaria"], as_index=False)[["value","value_scaled"]].sum()
         by_sec["valor_br"] = by_sec["value"].apply(br_currency)
         fig2 = px.bar(
@@ -241,17 +273,16 @@ with tab2:
             labels={"value_scaled": label_value(), "secretaria": "Secretaria", "year": "Ano"},
             title="Soma por Secretaria (período filtrado)"
         )
-        fig2.update_traces(
-            customdata=np.stack([by_sec["valor_br"]], axis=-1),
-            hovertemplate="Valor: %{customdata[0]}<extra></extra>"
-        )
-        st.plotly_chart(compact_layout(fig2, height=380), use_container_width=True)
-    else:
-        st.info("Sem dados para os filtros selecionados.")
+        fig2.update_traces(customdata=np.stack([by_sec["valor_br"]], axis=-1),
+                           hovertemplate="Valor: %{customdata[0]}<extra></extra>")
+        st.plotly_chart(compact_layout(fig2, 380), use_container_width=True)
 
-# ---------- Tab 3: Por Categoria (Soma) ----------
+# ---------- Tab 3 ----------
 with tab3:
-    if not filt.empty:
+    st.caption("Mostra a distribuição por categoria de vínculo (Agente Político, Efetivo etc.) dentro do período filtrado, comparando os anos.")
+    if filt.empty:
+        st.info("Sem dados para os filtros selecionados.")
+    else:
         by_cat = filt.groupby(["year","category"], as_index=False)[["value","value_scaled"]].sum()
         by_cat["valor_br"] = by_cat["value"].apply(br_currency)
         fig3 = px.bar(
@@ -259,31 +290,24 @@ with tab3:
             labels={"value_scaled": label_value(), "category": "Categoria", "year": "Ano"},
             title="Soma por Categoria (período filtrado)"
         )
-        fig3.update_traces(
-            customdata=np.stack([by_cat["valor_br"]], axis=-1),
-            hovertemplate="Valor: %{customdata[0]}<extra></extra>"
-        )
-        st.plotly_chart(compact_layout(fig3, height=380), use_container_width=True)
-    else:
-        st.info("Sem dados para os filtros selecionados.")
+        fig3.update_traces(customdata=np.stack([by_cat["valor_br"]], axis=-1),
+                           hovertemplate="Valor: %{customdata[0]}<extra></extra>")
+        st.plotly_chart(compact_layout(fig3, 380), use_container_width=True)
 
-# ---------- Tab 4: Δ por Secretaria (Evolução) ----------
+# ---------- Tab 4 (Δ por Secretaria) ----------
 with tab4:
-    st.subheader("Evolução mensal da variação (2025 - 2024)")
-    mode = st.radio("Tipo de variação", ["Valor (Δ R$)", "Percentual (Δ %)"], horizontal=True)
-    # Foco em 'Total' para leitura mais clara
-    comp_total = comp[comp["category"] == "Total"].copy()
-    comp_total = comp_total[
-        comp_total["secretaria"].isin(sec_sel) &
-        comp_total["date"].dt.month.between(month_range[0], month_range[1])
-    ].copy()
+    st.caption("Evolução da diferença mensal **2025 − 2024** por secretaria (Total). Acima de zero = aumento; abaixo de zero = redução. Mostramos as 10 mais relevantes para facilitar a leitura.")
+    st.subheader("Evolução mensal da variação (2025 - 2024) — Total")
+    mode = st.radio("Tipo de variação", ["Valor (Δ R$)", "Percentual (Δ %)"], horizontal=True, key="mode_delta")
+    comp_total = comp[(comp["category"] == "Total") &
+                      (comp["secretaria"].isin(sec_sel)) &
+                      (comp["date"].dt.month.between(month_range[0], month_range[1]))].copy()
     if comp_total.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
         comp_total["month_label"] = comp_total["month"].apply(month_label)
         if mode.startswith("Valor"):
             df_var = comp_total.groupby(["secretaria","date","month_label"], as_index=False)["var_abs"].sum()
-            # Seleciona top 10 por amplitude de variação no período para não poluir
             rank = (df_var.groupby("secretaria")["var_abs"].sum().abs()
                         .sort_values(ascending=False).head(10).index.tolist())
             show_df = df_var[df_var["secretaria"].isin(rank)].copy()
@@ -291,42 +315,39 @@ with tab4:
             fig4 = px.line(
                 show_df.sort_values(["secretaria","date"]),
                 x="month_label", y="var_abs_scaled", color="secretaria", markers=True,
-                labels={"var_abs_scaled": f"Δ ({scale_label})", "month_label": "Mês/2025 vs 2024"},
-                title="Δ em Valor por Secretaria (limite 10 mais relevantes no período)"
+                labels={"var_abs_scaled": f"Δ ({scale_label})", "month_label": "Mês"},
+                title="Δ em Valor por Secretaria (Top 10 em amplitude no período)"
             )
             fig4.add_hline(y=0, line_dash="dot", opacity=0.5)
-            st.plotly_chart(compact_layout(fig4, height=420), use_container_width=True)
+            st.plotly_chart(compact_layout(fig4, 420), use_container_width=True)
         else:
             df_var = comp_total.groupby(["secretaria","date","month_label"], as_index=False)["var_pct"].mean()
-            # Top 10 por amplitude média de variação %
             rank = (df_var.groupby("secretaria")["var_pct"].mean().abs()
                         .sort_values(ascending=False).head(10).index.tolist())
             show_df = df_var[df_var["secretaria"].isin(rank)].copy()
             fig4p = px.line(
                 show_df.sort_values(["secretaria","date"]),
                 x="month_label", y="var_pct", color="secretaria", markers=True,
-                labels={"var_pct": "Δ (%)", "month_label": "Mês/2025 vs 2024"},
-                title="Δ em Percentual por Secretaria (limite 10 mais relevantes no período)"
+                labels={"var_pct": "Δ (%)", "month_label": "Mês"},
+                title="Δ em Percentual por Secretaria (Top 10 em amplitude no período)"
             )
             fig4p.add_hline(y=0, line_dash="dot", opacity=0.5)
             fig4p.update_yaxes(tickformat=".2%")
-            st.plotly_chart(compact_layout(fig4p, height=420), use_container_width=True)
+            st.plotly_chart(compact_layout(fig4p, 420), use_container_width=True)
 
-        # Ranking de aumentos e reduções (somatório no período)
-        st.markdown("### Ranking no período filtrado")
+        st.markdown("### Ranking no período filtrado (Δ Total)")
         rank_df = comp_total.groupby("secretaria", as_index=False)["var_abs"].sum().rename(columns={"var_abs":"var_total"})
         col_a, col_b = st.columns(2)
-        top_down = rank_df.sort_values("var_total").head(5).copy()    # maiores reduções (negativos)
-        top_up   = rank_df.sort_values("var_total", ascending=False).head(5).copy()  # maiores aumentos
+        top_down = rank_df.sort_values("var_total").head(5).copy()
+        top_up   = rank_df.sort_values("var_total", ascending=False).head(5).copy()
         top_down["Δ (R$)"] = top_down["var_total"].apply(br_currency)
         top_up["Δ (R$)"] = top_up["var_total"].apply(br_currency)
-        col_a.markdown("**Maiores Reduções (Δ R$)**")
-        col_a.dataframe(top_down[["secretaria","Δ (R$)"]], use_container_width=True)
-        col_b.markdown("**Maiores Aumentos (Δ R$)**")
-        col_b.dataframe(top_up[["secretaria","Δ (R$)"]], use_container_width=True)
+        col_a.markdown("**Maiores Reduções (Δ R$)**"); col_a.dataframe(top_down[["secretaria","Δ (R$)"]], use_container_width=True)
+        col_b.markdown("**Maiores Aumentos (Δ R$)**");  col_b.dataframe(top_up[["secretaria","Δ (R$)"]],  use_container_width=True)
 
-# ---------- Tab 5: Heatmap (Δ por mês) ----------
+# ---------- Tab 5 (Heatmap) ----------
 with tab5:
+    st.caption("Mapa de calor da variação **2025 − 2024** (Total) por mês e secretaria. Tons acima do centro indicam aumento; abaixo, redução.")
     st.subheader("Heatmap de variação por secretaria e mês (Total)")
     mode_hm = st.radio("Métrica do heatmap", ["Valor (Δ R$)", "Percentual (Δ %)"], horizontal=True, key="hm")
     comp_total = comp[(comp["category"] == "Total") &
@@ -335,36 +356,36 @@ with tab5:
     if comp_total.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        comp_total["m"] = comp_total["month"]
-        comp_total["m_lbl"] = comp_total["m"].apply(month_label)
+        comp_total["m_lbl"] = comp_total["month"].apply(month_label)
         if mode_hm.startswith("Valor"):
             mat = comp_total.pivot_table(index="secretaria", columns="m_lbl", values="var_abs", aggfunc="sum").fillna(0.0)
-            # Escala escolhida
             mat = mat / scale_div
-            title = f"Δ em Valor ({scale_label})"
-            zfmt = ",.2f"
+            title = f"Δ em Valor ({scale_label})"; zfmt = ",.2f"
         else:
             mat = comp_total.pivot_table(index="secretaria", columns="m_lbl", values="var_pct", aggfunc="mean")
-            title = "Δ em Percentual"
-            zfmt = ".2%"
-        # Ordena colunas por mês
+            title = "Δ em Percentual"; zfmt = ".2%"
         col_order = [month_label(m) for m in range(month_range[0], month_range[1]+1)]
         mat = mat.reindex(columns=[c for c in col_order if c in mat.columns])
-        fig_hm = px.imshow(
-            mat,
-            labels=dict(x="Mês", y="Secretaria", color=title),
-            aspect="auto",
-            color_continuous_midpoint=0
-        )
-        fig_hm.update_traces(hovertemplate="%{y} | %{x}: %{z:"+zfmt+"}<extra></extra>")
-        st.plotly_chart(compact_layout(fig_hm, height=520), use_container_width=True)
 
-# ---------- Tab 6: Detalhe da Secretaria ----------
+        try:
+            fig_hm = px.imshow(mat, labels=dict(x="Mês", y="Secretaria", color=title), aspect="auto", color_continuous_midpoint=0)
+            fig_hm.update_traces(hovertemplate="%{y} | %{x}: %{z"+(":"+zfmt if zfmt else "")+"}<extra></extra>")
+            st.plotly_chart(compact_layout(fig_hm, 520), use_container_width=True)
+        except Exception as err:
+            st.warning(f"Heatmap não pôde ser renderizado ({err}). Gerando alternativa com barras empilhadas.")
+            alt = comp_total.groupby(["m_lbl","secretaria"], as_index=False)["var_abs"].sum() if mode_hm.startswith("Valor") \
+                  else comp_total.groupby(["m_lbl","secretaria"], as_index=False)["var_pct"].mean()
+            fig_alt = px.bar(alt, x="m_lbl", y=alt.columns[-1], color="secretaria", barmode="relative",
+                             labels={"m_lbl":"Mês"}, title=f"Alternativa ao Heatmap - {title}")
+            st.plotly_chart(compact_layout(fig_alt, 520), use_container_width=True)
+
+# ---------- Tab 6 (Detalhe) ----------
 with tab6:
+    st.caption("Zoom em uma secretaria: KPIs, evolução 2024×2025 e barras do Δ mensal. Permite trocar a categoria.")
     st.subheader("Análise detalhada por secretaria")
-    # Se o filtro lateral tiver só 1 secretaria, usa ela. Senão permite escolher.
-    default_sec = sec_sel[0] if len(sec_sel) == 1 else (sec_opts[0] if sec_opts else None)
-    sec_one = st.selectbox("Secretaria", options=sec_opts, index=(sec_opts.index(default_sec) if default_sec in sec_opts else 0))
+    sec_one = safe_selectbox("Secretaria", options=sec_opts, key="sec_one")
+    if sec_one is None:
+        st.stop()
     focus_cat = st.selectbox("Categoria (para séries 2024 x 2025)", options=CATEGORIES, index=CATEGORIES.index("Total"))
     mask_det = (
         (fact["secretaria"] == sec_one) &
@@ -380,7 +401,6 @@ with tab6:
         det["month_lbl"] = det["month"].apply(month_label)
         det["value_scaled"] = det["value"] / scale_div
 
-        # KPIs da secretaria (só para o foco_cat)
         s24 = det.loc[det["year"] == 2024, "value"].sum()
         s25 = det.loc[det["year"] == 2025, "value"].sum()
         svar = s25 - s24
@@ -391,22 +411,19 @@ with tab6:
         k3.metric("Δ (R$)", br_currency(svar))
         k4.metric("Δ (%)", br_percent(svarp) if pd.notna(svarp) else "-")
 
-        # Linhas 2024 x 2025
         s_line = det.groupby(["year","month","month_lbl"], as_index=False)["value_scaled"].sum().sort_values(["year","month"])
         fig_d1 = px.line(
             s_line, x="month_lbl", y="value_scaled", color="year", markers=True,
             labels={"value_scaled": label_value(), "month_lbl":"Mês", "year":"Ano"},
             title=f"Evolução mensal - {sec_one} ({focus_cat})"
         )
-        st.plotly_chart(compact_layout(fig_d1, height=380), use_container_width=True)
+        st.plotly_chart(compact_layout(fig_d1, 360), use_container_width=True)
 
-        # Barras do Δ mensal (Total usa comp; para categoria específica calculamos Δ direto)
         if focus_cat == "Total":
             comp_det = comp[(comp["secretaria"]==sec_one) & (comp["category"]=="Total") &
                             (comp["date"].dt.month.between(month_range[0], month_range[1]))].copy()
             dbar = comp_det[["month","date","var_abs"]].copy()
         else:
-            # Calcula Δ (2025-2024) por mês para a categoria selecionada
             pvt = (det.pivot_table(index=["month","date"], columns="year", values="value", aggfunc="sum")
                      .reset_index().rename(columns={2024:"v24", 2025:"v25"}))
             pvt["var_abs"] = pvt["v25"].fillna(0.0) - pvt["v24"].fillna(0.0)
@@ -422,17 +439,13 @@ with tab6:
             title=f"Δ mensal (2025 - 2024) - {sec_one} ({focus_cat})"
         )
         fig_d2.add_hline(y=0, line_dash="dot", opacity=0.5)
-        fig_d2.update_traces(
-            customdata=np.stack([dbar["Δ (R$)"]], axis=-1),
-            hovertemplate="Δ: %{customdata[0]}<extra></extra>"
-        )
-        st.plotly_chart(compact_layout(fig_d2, height=360), use_container_width=True)
+        fig_d2.update_traces(customdata=np.stack([dbar["Δ (R$)"]], axis=-1),
+                             hovertemplate="Δ: %{customdata[0]}<extra></extra>")
+        st.plotly_chart(compact_layout(fig_d2, 340), use_container_width=True)
 
-        # Tabela comparativa detalhada (não formatada para download)
         st.markdown("**Tabela Δ mensal (detalhe)**")
         tbl = dbar[["month_lbl","var_abs"]].rename(columns={"month_lbl":"Mês","var_abs":"Δ (R$)"})
-        tbl_fmt = tbl.copy()
-        tbl_fmt["Δ (R$)"] = tbl_fmt["Δ (R$)"].apply(br_currency)
+        tbl_fmt = tbl.copy(); tbl_fmt["Δ (R$)"] = tbl_fmt["Δ (R$)"].apply(br_currency)
         st.dataframe(tbl_fmt, use_container_width=True)
         st.download_button(
             "⬇️ Baixar CSV (Δ mensal - detalhe)",
@@ -442,4 +455,4 @@ with tab6:
         )
 
 st.markdown("---")
-st.caption("KPIs e hovers mostram valores reais em R$. Use a escala no menu lateral para ajustar o eixo Y. Heatmap e Δ destacam rapidamente aumento/redução por secretaria.")
+st.caption("KPIs e hovers sempre em R$. Ajuste a escala no menu lateral. Δ e Heatmap destacam aumento/redução por secretaria.")
