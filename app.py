@@ -14,19 +14,15 @@ from datetime import datetime
 # ================== Config ==================
 st.set_page_config(page_title="Folha - Comparativo 2024 x 2025", layout="wide")
 st.title("📊 Painel de Folha (2024 x 2025)")
-st.caption("Envie o arquivo **Comparativo geral.xlsx**. Se algo quebrar, o app mostra o motivo e onde corrigir.")
+st.caption("Envie o arquivo **Comparativo geral.xlsx**. O app valida colunas e evita dupla contagem do 'Total'.")
 
-# --- CSS: reduzir tamanho dos números dos KPIs (sem cortar conteúdo) ---
+# --- CSS: reduzir tamanho dos números dos KPIs ---
 st.markdown(
     """
     <style>
-      /* cartão do KPI */
       div[data-testid="stMetric"] { padding: 0.25rem 0.5rem; }
-      /* rótulo menor */
       div[data-testid="stMetric"] [data-testid="stMetricLabel"] { font-size: 0.85rem; }
-      /* valor menor (ajuste aqui se quiser ainda menor/maior) */
       div[data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.6rem; }
-      /* seta do delta menor */
       div[data-testid="stMetric"] [data-testid="stMetricDelta"] svg { transform: scale(0.85); }
     </style>
     """,
@@ -63,12 +59,11 @@ def month_label(m:int) -> str:
     except Exception:
         return str(m)
 
-def safe_selectbox(label, options, default_first=True, key=None):
+def safe_selectbox(label, options, key=None):
     if not options:
         st.warning(f"Não há opções para '{label}'. Verifique os filtros/dados.")
         return None
-    idx = 0 if default_first else 0
-    return st.selectbox(label, options=options, index=idx, key=key)
+    return st.selectbox(label, options=options, index=0, key=key)
 
 # ================== Transform ==================
 @st.cache_data(show_spinner=False)
@@ -89,7 +84,7 @@ def transform_excel(file_bytes: bytes):
             if alt in df.columns: mes_col = alt; break
 
     if sec_col is None or mes_col is None:
-        raise ValueError("Planilha precisa ter colunas 'Secretaria' e 'Mês/Ano' (nomes podem ter espaços).")
+        raise ValueError("Planilha precisa ter colunas 'Secretaria' e 'Mês/Ano'.")
 
     df[sec_col] = df[sec_col].ffill()
     df = df[df[mes_col].notna()].copy()
@@ -185,15 +180,27 @@ year_opts = sorted(fact["year"].unique().tolist())
 month_opts = sorted(dim_date["month"].unique().tolist())
 month_min, month_max = (min(month_opts), max(month_opts))
 
+# Seleções
 sec_sel = st.sidebar.multiselect("Secretaria (para visões gerais)", sec_opts, default=sec_opts)
+# Deixo todas marcadas, mas o modo de TOTAL decide se 'Total' entra na soma
 cat_sel = st.sidebar.multiselect("Categoria", cat_opts, default=cat_opts)
 year_sel = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_range = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
+# NOVO: modo de cálculo do total (evita dupla contagem)
+total_mode = st.sidebar.radio(
+    "Cálculo do TOTAL",
+    ["Usar coluna 'Total' (recomendado)", "Somar categorias selecionadas"],
+    index=0,
+    help="Para evitar dupla contagem, quando 'Total' está marcado junto com categorias."
+)
+
+# Escala
 scale_name = st.sidebar.selectbox("Escala do eixo Y", ["Reais (R$)", "Mil (R$ mil)", "Milhões (R$ mi)"], index=0)
 scale_map = {"Reais (R$)":(1.0,"R$"), "Mil (R$ mil)":(1e3,"R$ mil"), "Milhões (R$ mi)":(1e6,"R$ mi")}
 scale_div, scale_label = scale_map[scale_name]
 
+# Filtro base
 mask = (
     fact["secretaria"].isin(sec_sel) &
     fact["category"].isin(cat_sel) &
@@ -201,11 +208,28 @@ mask = (
     fact["date"].dt.month.between(month_range[0], month_range[1])
 )
 filt = fact.loc[mask].copy()
-filt["value_scaled"] = filt["value"] / scale_div
 
-# ================== KPIs ==================
-kpi_2024 = filt.loc[filt["year"] == 2024, "value"].sum()
-kpi_2025 = filt.loc[filt["year"] == 2025, "value"].sum()
+# dataframe para SOMAS (KPIs, Evolução Mensal e Por Secretaria)
+def make_total_df(base_df, selected_categories, mode):
+    df = base_df.copy()
+    if mode.startswith("Usar coluna 'Total'"):
+        # se 'Total' está selecionado, usa só ele; senão, usa as categorias marcadas
+        if "Total" in selected_categories:
+            df = df[df["category"] == "Total"].copy()
+        else:
+            df = df[df["category"].isin(selected_categories)].copy()
+    else:
+        # somar categorias: ignora 'Total' se estiver marcado
+        cats = [c for c in selected_categories if c != "Total"]
+        df = df[df["category"].isin(cats)].copy()
+    df["value_scaled"] = df["value"] / scale_div
+    return df
+
+filt_tot = make_total_df(filt, cat_sel, total_mode)
+
+# ================== KPIs (usam filt_tot) ==================
+kpi_2024 = filt_tot.loc[filt_tot["year"] == 2024, "value"].sum()
+kpi_2025 = filt_tot.loc[filt_tot["year"] == 2025, "value"].sum()
 kpi_var_abs = kpi_2025 - kpi_2024
 kpi_var_pct = (kpi_var_abs / kpi_2024) if kpi_2024 else np.nan
 
@@ -242,11 +266,11 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 # ---------- Tab 1 ----------
 with tab1:
-    st.caption("Mostra a evolução mensal somada do que estiver filtrado. Cada linha é um ano. Subida = aumento de gasto; queda = redução.")
-    if filt.empty:
+    st.caption("Mostra a evolução mensal somada do que estiver filtrado. O total é calculado conforme o seletor lateral (usar 'Total' ou somar categorias).")
+    if filt_tot.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        evo = (filt.assign(month=lambda d: d["date"].dt.month)
+        evo = (filt_tot.assign(month=lambda d: d["date"].dt.month)
                     .groupby(["year","month"], as_index=False)[["value","value_scaled"]].sum()
                     .sort_values(["year","month"]))
         evo["valor_br"] = evo["value"].apply(br_currency)
@@ -262,11 +286,11 @@ with tab1:
 
 # ---------- Tab 2 ----------
 with tab2:
-    st.caption("Compara o total do período filtrado por secretaria. Útil para ver quem mais pesa na folha dentro do recorte.")
-    if filt.empty:
+    st.caption("Compara o total do período filtrado por secretaria. O total segue o modo escolhido (usar 'Total' ou somar categorias, sem dupla contagem).")
+    if filt_tot.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        by_sec = filt.groupby(["year","secretaria"], as_index=False)[["value","value_scaled"]].sum()
+        by_sec = filt_tot.groupby(["year","secretaria"], as_index=False)[["value","value_scaled"]].sum()
         by_sec["valor_br"] = by_sec["value"].apply(br_currency)
         fig2 = px.bar(
             by_sec, x="secretaria", y="value_scaled", color="year", barmode="group",
@@ -279,11 +303,12 @@ with tab2:
 
 # ---------- Tab 3 ----------
 with tab3:
-    st.caption("Mostra a distribuição por categoria de vínculo (Agente Político, Efetivo etc.) dentro do período filtrado, comparando os anos.")
+    st.caption("Distribuição por categoria de vínculo (Agente Político, Efetivo etc.) dentro do período filtrado, comparando os anos.")
     if filt.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        by_cat = filt.groupby(["year","category"], as_index=False)[["value","value_scaled"]].sum()
+        by_cat = filt.groupby(["year","category"], as_index=False)[["value"]].sum()
+        by_cat["value_scaled"] = by_cat["value"] / scale_div
         by_cat["valor_br"] = by_cat["value"].apply(br_currency)
         fig3 = px.bar(
             by_cat, x="category", y="value_scaled", color="year", barmode="group",
@@ -296,7 +321,7 @@ with tab3:
 
 # ---------- Tab 4 (Δ por Secretaria) ----------
 with tab4:
-    st.caption("Evolução da diferença mensal **2025 − 2024** por secretaria (Total). Acima de zero = aumento; abaixo de zero = redução. Mostramos as 10 mais relevantes para facilitar a leitura.")
+    st.caption("Evolução da diferença mensal **2025 − 2024** por secretaria (Total). Acima de zero = aumento; abaixo de zero = redução. Mostramos as 10 mais relevantes.")
     st.subheader("Evolução mensal da variação (2025 - 2024) — Total")
     mode = st.radio("Tipo de variação", ["Valor (Δ R$)", "Percentual (Δ %)"], horizontal=True, key="mode_delta")
     comp_total = comp[(comp["category"] == "Total") &
@@ -455,4 +480,4 @@ with tab6:
         )
 
 st.markdown("---")
-st.caption("KPIs e hovers sempre em R$. Ajuste a escala no menu lateral. Δ e Heatmap destacam aumento/redução por secretaria.")
+st.caption("As abas de soma seguem o seletor de TOTAL no menu lateral. Isso impede dupla contagem da coluna 'Total'.")
