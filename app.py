@@ -3,6 +3,7 @@
 """
 Painel Streamlit para processar "Comparativo geral.xlsx" e exibir dashboards
 por secretaria (evolução, variações, heatmap e detalhe), com formatação BR.
+Suporta planilhas SEM as colunas 'Total 2024/2025' (gera TOTAL derivado).
 """
 import io
 import numpy as np
@@ -14,9 +15,9 @@ from datetime import datetime
 # ================== Config ==================
 st.set_page_config(page_title="Folha - Comparativo 2024 x 2025", layout="wide")
 st.title("📊 Painel de Folha (2024 x 2025)")
-st.caption("Envie o arquivo **Comparativo geral.xlsx**. O app valida colunas e evita dupla contagem do 'Total'.")
+st.caption("Envie o arquivo **Comparativo geral.xlsx**. Evita dupla contagem e calcula TOTAL mesmo sem colunas 'Total'.")
 
-# --- CSS: reduzir tamanho dos números dos KPIs ---
+# --- CSS: KPIs menores ---
 st.markdown(
     """
     <style>
@@ -32,7 +33,9 @@ st.markdown(
 # ================== Helpers ==================
 PT_MONTHS = {"Jan":1,"Fev":2,"Mar":3,"Abr":4,"Mai":5,"Jun":6,"Jul":7,"Ago":8,"Set":9,"Out":10,"Nov":11,"Dez":12}
 MONTH_ABBR = {v:k for k,v in PT_MONTHS.items()}
-CATEGORIES = ["Agente Político","Eletivo","Comissionado","Contratado","Efetivo","Total"]
+BASE_CATEGORIES = ["Agente Político","Eletivo","Comissionado","Contratado","Efetivo"]
+TOT_LABEL = "Total"
+ALL_CATEGORIES = BASE_CATEGORIES + [TOT_LABEL]
 
 def extract_month(m):
     try:
@@ -99,54 +102,59 @@ def transform_excel(file_bytes: bytes):
                 return c
         return None
 
-    base_2024 = {
-        "Agente Político": find_col("Agente Político 2024"),
-        "Eletivo":         find_col("Eletivo 2024"),
-        "Comissionado":    find_col("Comissionado 2024"),
-        "Contratado":      find_col("Contratado 2024"),
-        "Efetivo":         find_col("Efetivo 2024"),
-        "Total":           find_col("Total 2024"),
-    }
-    base_2025 = {
-        "Agente Político": find_col("Agente Político 2025"),
-        "Eletivo":         find_col("Eletivo 2025"),
-        "Comissionado":    find_col("Comissionado 2025"),
-        "Contratado":      find_col("Contratado 2025"),
-        "Efetivo":         find_col("Efetivo 2025"),
-        "Total":           find_col("Total 2025"),
-    }
+    # Mapa de colunas por ano (algumas podem não existir)
+    cols_2024 = {cat: find_col(f"{cat} 2024") for cat in BASE_CATEGORIES}
+    cols_2025 = {cat: find_col(f"{cat} 2025") for cat in BASE_CATEGORIES}
+    col_total_2024 = find_col(f"{TOT_LABEL} 2024")
+    col_total_2025 = find_col(f"{TOT_LABEL} 2025")
+    has_total_cols = (col_total_2024 is not None and col_total_2025 is not None)
 
-    if base_2024["Total"] is None or base_2025["Total"] is None:
-        faltantes = [k for k in ["Total 2024","Total 2025"] if find_col(k) is None]
-        raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(faltantes)}.")
-
+    # Constrói fato com as categorias base (sem Total)
     rows = []
     for _, r in df.iterrows():
         m = r["MesIndex"]
         if pd.isna(m): 
             continue
-        for cat in CATEGORIES:
-            c24 = base_2024.get(cat); c25 = base_2025.get(cat)
-            v24 = float(r[c24]) if (c24 and pd.notna(r.get(c24))) else np.nan
-            v25 = float(r[c25]) if (c25 and pd.notna(r.get(c25))) else np.nan
-            if pd.notna(v24):
+        for cat in BASE_CATEGORIES:
+            c24 = cols_2024.get(cat)
+            c25 = cols_2025.get(cat)
+            if c24 and pd.notna(r.get(c24)):
                 rows.append({"secretaria": str(r[sec_col]).strip(), "date": datetime(2024,int(m),1),
-                             "year": 2024, "category": cat, "value": v24})
-            if pd.notna(v25):
+                             "year": 2024, "category": cat, "value": float(r[c24])})
+            if c25 and pd.notna(r.get(c25)):
                 rows.append({"secretaria": str(r[sec_col]).strip(), "date": datetime(2025,int(m),1),
-                             "year": 2025, "category": cat, "value": v25})
+                             "year": 2025, "category": cat, "value": float(r[c25])})
+
+        # Se existir coluna Total no Excel, adiciona também
+        if has_total_cols:
+            if pd.notna(r.get(col_total_2024)):
+                rows.append({"secretaria": str(r[sec_col]).strip(), "date": datetime(2024,int(m),1),
+                             "year": 2024, "category": TOT_LABEL, "value": float(r[col_total_2024])})
+            if pd.notna(r.get(col_total_2025)):
+                rows.append({"secretaria": str(r[sec_col]).strip(), "date": datetime(2025,int(m),1),
+                             "year": 2025, "category": TOT_LABEL, "value": float(r[col_total_2025])})
 
     fact = pd.DataFrame(rows)
     if fact.empty:
         raise ValueError("Após leitura, não há linhas com valores. Confirme os nomes das colunas e meses.")
 
-    fact["category"] = pd.Categorical(fact["category"], categories=CATEGORIES, ordered=True)
+    # Se NÃO houver colunas 'Total', gera TOTAL derivado somando categorias base
+    if not has_total_cols:
+        base_only = fact[fact["category"].isin(BASE_CATEGORIES)].copy()
+        totals = (base_only.groupby(["secretaria","date","year"], as_index=False)["value"].sum()
+                            .assign(category=TOT_LABEL))
+        fact = pd.concat([fact, totals], ignore_index=True)
 
+    # Ordenação de categorias
+    fact["category"] = pd.Categorical(fact["category"], categories=ALL_CATEGORIES, ordered=True)
+
+    # Dimensões
     dim_date = (fact[["date"]].drop_duplicates()
                 .assign(year=lambda d: d["date"].dt.year, month=lambda d: d["date"].dt.month)
                 .sort_values("date"))
     dim_secretaria = fact[["secretaria"]].drop_duplicates().sort_values("secretaria")
 
+    # Comparativo 24 x 25 (inclui TOT_LABEL, que é original ou derivado)
     comp = (fact.pivot_table(index=["secretaria","date","category"], columns="year", values="value", aggfunc="sum")
                  .reset_index().rename_axis(None, axis=1)
                  .rename(columns={2024:"value_2024", 2025:"value_2025"}))
@@ -157,7 +165,7 @@ def transform_excel(file_bytes: bytes):
     comp["year"] = comp["date"].dt.year
     comp["month"] = comp["date"].dt.month
 
-    return fact, dim_date, dim_secretaria, comp
+    return fact, dim_date, dim_secretaria, comp, has_total_cols
 
 # ================== Upload ==================
 uploaded = st.file_uploader("Envie o arquivo Excel (Comparativo geral.xlsx)", type=["xlsx"])
@@ -167,7 +175,7 @@ if not uploaded:
 
 # ================== Processa ==================
 try:
-    fact, dim_date, dim_secretaria, comp = transform_excel(uploaded.getvalue())
+    fact, dim_date, dim_secretaria, comp, has_total_cols = transform_excel(uploaded.getvalue())
 except Exception as e:
     st.error(f"Erro ao processar a planilha: {e}")
     st.stop()
@@ -175,25 +183,27 @@ except Exception as e:
 # ================== Filtros ==================
 st.sidebar.header("Filtros")
 sec_opts = sorted(dim_secretaria["secretaria"].unique().tolist())
-cat_opts = CATEGORIES
+cat_opts = ALL_CATEGORIES  # inclui 'Total' (original ou derivado)
 year_opts = sorted(fact["year"].unique().tolist())
 month_opts = sorted(dim_date["month"].unique().tolist())
 month_min, month_max = (min(month_opts), max(month_opts))
 
-# Seleções
 sec_sel = st.sidebar.multiselect("Secretaria (para visões gerais)", sec_opts, default=sec_opts)
-# Deixo todas marcadas, mas o modo de TOTAL decide se 'Total' entra na soma
 cat_sel = st.sidebar.multiselect("Categoria", cat_opts, default=cat_opts)
 year_sel = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_range = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
-# NOVO: modo de cálculo do total (evita dupla contagem)
-total_mode = st.sidebar.radio(
-    "Cálculo do TOTAL",
-    ["Usar coluna 'Total' (recomendado)", "Somar categorias selecionadas"],
-    index=0,
-    help="Para evitar dupla contagem, quando 'Total' está marcado junto com categorias."
-)
+# Modo de total: se NÃO houver colunas 'Total', força soma de categorias
+if has_total_cols:
+    total_mode = st.sidebar.radio(
+        "Cálculo do TOTAL",
+        ["Usar coluna 'Total' (recomendado)", "Somar categorias selecionadas"],
+        index=0,
+        help="Evita dupla contagem quando 'Total' aparece junto com categorias."
+    )
+else:
+    total_mode = "Somar categorias selecionadas"
+    st.sidebar.info("Colunas 'Total' ausentes. O total será calculado pela soma das categorias.")
 
 # Escala
 scale_name = st.sidebar.selectbox("Escala do eixo Y", ["Reais (R$)", "Mil (R$ mil)", "Milhões (R$ mi)"], index=0)
@@ -209,25 +219,21 @@ mask = (
 )
 filt = fact.loc[mask].copy()
 
-# dataframe para SOMAS (KPIs, Evolução Mensal e Por Secretaria)
-def make_total_df(base_df, selected_categories, mode):
+# SOMAS (KPIs/Evolução/Por Secretaria) – respeita modo de total
+def make_total_df(base_df, selected_categories, mode, has_tot):
     df = base_df.copy()
-    if mode.startswith("Usar coluna 'Total'"):
-        # se 'Total' está selecionado, usa só ele; senão, usa as categorias marcadas
-        if "Total" in selected_categories:
-            df = df[df["category"] == "Total"].copy()
-        else:
-            df = df[df["category"].isin(selected_categories)].copy()
+    if mode.startswith("Usar coluna 'Total'") and has_tot:
+        # usa apenas a linha de 'Total' (que pode ser original ou derivada; se derivada e has_tot=False, já tratamos acima)
+        df = df[df["category"] == TOT_LABEL].copy()
     else:
-        # somar categorias: ignora 'Total' se estiver marcado
-        cats = [c for c in selected_categories if c != "Total"]
+        cats = [c for c in selected_categories if c != TOT_LABEL]
         df = df[df["category"].isin(cats)].copy()
     df["value_scaled"] = df["value"] / scale_div
     return df
 
-filt_tot = make_total_df(filt, cat_sel, total_mode)
+filt_tot = make_total_df(filt, cat_sel, total_mode, has_total_cols)
 
-# ================== KPIs (usam filt_tot) ==================
+# ================== KPIs ==================
 kpi_2024 = filt_tot.loc[filt_tot["year"] == 2024, "value"].sum()
 kpi_2025 = filt_tot.loc[filt_tot["year"] == 2025, "value"].sum()
 kpi_var_abs = kpi_2025 - kpi_2024
@@ -266,7 +272,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 # ---------- Tab 1 ----------
 with tab1:
-    st.caption("Mostra a evolução mensal somada do que estiver filtrado. O total é calculado conforme o seletor lateral (usar 'Total' ou somar categorias).")
+    st.caption("Evolução mensal somada do que estiver filtrado. O total usa a coluna 'Total' (se existir) ou a soma das categorias.")
     if filt_tot.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
@@ -286,7 +292,7 @@ with tab1:
 
 # ---------- Tab 2 ----------
 with tab2:
-    st.caption("Compara o total do período filtrado por secretaria. O total segue o modo escolhido (usar 'Total' ou somar categorias, sem dupla contagem).")
+    st.caption("Comparação do total do período filtrado por secretaria. Usa 'Total' (se houver) ou soma das categorias, sem dupla contagem.")
     if filt_tot.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
@@ -303,11 +309,12 @@ with tab2:
 
 # ---------- Tab 3 ----------
 with tab3:
-    st.caption("Distribuição por categoria de vínculo (Agente Político, Efetivo etc.) dentro do período filtrado, comparando os anos.")
+    st.caption("Distribuição por categoria de vínculo dentro do período filtrado, comparando os anos. (Exclui 'Total' para não distorcer a leitura.)")
     if filt.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        by_cat = filt.groupby(["year","category"], as_index=False)[["value"]].sum()
+        by_cat = (filt[filt["category"] != TOT_LABEL]
+                    .groupby(["year","category"], as_index=False)["value"].sum())
         by_cat["value_scaled"] = by_cat["value"] / scale_div
         by_cat["valor_br"] = by_cat["value"].apply(br_currency)
         fig3 = px.bar(
@@ -321,10 +328,10 @@ with tab3:
 
 # ---------- Tab 4 (Δ por Secretaria) ----------
 with tab4:
-    st.caption("Evolução da diferença mensal **2025 − 2024** por secretaria (Total). Acima de zero = aumento; abaixo de zero = redução. Mostramos as 10 mais relevantes.")
+    st.caption("Evolução da diferença mensal **2025 − 2024** por secretaria usando o TOTAL (original ou derivado). Acima de zero = aumento; abaixo = redução.")
     st.subheader("Evolução mensal da variação (2025 - 2024) — Total")
     mode = st.radio("Tipo de variação", ["Valor (Δ R$)", "Percentual (Δ %)"], horizontal=True, key="mode_delta")
-    comp_total = comp[(comp["category"] == "Total") &
+    comp_total = comp[(comp["category"] == TOT_LABEL) &
                       (comp["secretaria"].isin(sec_sel)) &
                       (comp["date"].dt.month.between(month_range[0], month_range[1]))].copy()
     if comp_total.empty:
@@ -372,10 +379,10 @@ with tab4:
 
 # ---------- Tab 5 (Heatmap) ----------
 with tab5:
-    st.caption("Mapa de calor da variação **2025 − 2024** (Total) por mês e secretaria. Tons acima do centro indicam aumento; abaixo, redução.")
+    st.caption("Mapa de calor da variação **2025 − 2024** (TOTAL derivado ou original) por mês e secretaria.")
     st.subheader("Heatmap de variação por secretaria e mês (Total)")
     mode_hm = st.radio("Métrica do heatmap", ["Valor (Δ R$)", "Percentual (Δ %)"], horizontal=True, key="hm")
-    comp_total = comp[(comp["category"] == "Total") &
+    comp_total = comp[(comp["category"] == TOT_LABEL) &
                       (comp["secretaria"].isin(sec_sel)) &
                       (comp["date"].dt.month.between(month_range[0], month_range[1]))].copy()
     if comp_total.empty:
@@ -411,7 +418,7 @@ with tab6:
     sec_one = safe_selectbox("Secretaria", options=sec_opts, key="sec_one")
     if sec_one is None:
         st.stop()
-    focus_cat = st.selectbox("Categoria (para séries 2024 x 2025)", options=CATEGORIES, index=CATEGORIES.index("Total"))
+    focus_cat = st.selectbox("Categoria (para séries 2024 x 2025)", options=ALL_CATEGORIES, index=ALL_CATEGORIES.index(TOT_LABEL))
     mask_det = (
         (fact["secretaria"] == sec_one) &
         (fact["category"] == focus_cat) &
@@ -444,8 +451,9 @@ with tab6:
         )
         st.plotly_chart(compact_layout(fig_d1, 360), use_container_width=True)
 
-        if focus_cat == "Total":
-            comp_det = comp[(comp["secretaria"]==sec_one) & (comp["category"]=="Total") &
+        # Δ mensal
+        if focus_cat == TOT_LABEL:
+            comp_det = comp[(comp["secretaria"]==sec_one) & (comp["category"]==TOT_LABEL) &
                             (comp["date"].dt.month.between(month_range[0], month_range[1]))].copy()
             dbar = comp_det[["month","date","var_abs"]].copy()
         else:
@@ -480,4 +488,4 @@ with tab6:
         )
 
 st.markdown("---")
-st.caption("As abas de soma seguem o seletor de TOTAL no menu lateral. Isso impede dupla contagem da coluna 'Total'.")
+st.caption("Se a planilha não tiver 'Total', o painel cria um TOTAL derivado somando categorias (por secretaria/mês/ano).")
