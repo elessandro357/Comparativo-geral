@@ -3,11 +3,10 @@
 """
 Painel Streamlit para processar "Comparativo geral.xlsx"
 Comparações 2024 x 2025 por secretaria/categoria, KPIs BR, barras lado a lado,
-ranking de Δ% (aumentos e reduções) com Top N e PDF A4 (com kaleido+reportlab).
+ranking de Δ% (aumentos e reduções) com Top N e exportação PDF A4 opcional.
 
-Como rodar:
-  pip install --upgrade streamlit pandas numpy plotly openpyxl kaleido reportlab
-  streamlit run app.py
+Para PDF A4 (opcional):
+  pip install --upgrade kaleido==0.2.1 reportlab==3.6.13
 """
 import io
 import numpy as np
@@ -16,9 +15,21 @@ import streamlit as st
 import plotly.express as px
 import plotly.io as pio
 from datetime import datetime
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
+
+# ==== Dependências de PDF (opcionais e não bloqueantes) ====
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.utils import ImageReader
+    PDF_AVAILABLE = True
+except Exception:
+    PDF_AVAILABLE = False
+
+try:
+    import kaleido  # usado pelo Plotly para exportar imagens
+    KALEIDO_AVAILABLE = True
+except Exception:
+    KALEIDO_AVAILABLE = False
 
 # ============== Config ==============
 st.set_page_config(page_title="Folha - Comparativo 2024 x 2025", layout="wide")
@@ -311,9 +322,9 @@ with tabA:
         cmp = (y24.rename(columns={"value":"v24"})[["secretaria","v24"]]
                    .merge(y25.rename(columns={"value":"v25"})[["secretaria","v25"]], on="secretaria", how="outer")
                    .fillna(0.0))
-        # aumentos: (2025-2024)/2024 (positivos)
+        # aumentos: (2025-2024)/2024
         cmp["aumento_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v25"]-cmp["v24"])/cmp["v24"])
-        # reduções: (2024-2025)/2024 (positivos)
+        # reduções: (2024-2025)/2024
         cmp["reducao_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v24"]-cmp["v25"])/cmp["v24"])
         cmp["Δ (R$)"]       = cmp["v25"] - cmp["v24"]
 
@@ -445,61 +456,66 @@ with tabC:
 # ============== PDF A4 ==============
 st.markdown("---")
 st.subheader("📄 Relatório A4")
-st.caption("Gera um PDF A4 com os gráficos exibidos nas abas acima (visuais e filtros atuais).")
-
-def build_pdf(figs):
-    # Tamanhos A4
-    PAGE_W, PAGE_H = A4  # 595 x 842 pt
-    MARGIN = 36         # 0.5"
-    plot_w = PAGE_W - 2*MARGIN
-    plot_h = 320        # cabe 2 gráficos por página
-
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    c.setTitle("Relatório Folha - A4")
-
-    y_slots = [PAGE_H - MARGIN - plot_h, MARGIN + 10]  # top e bottom
-
-    i = 0
-    for title, fig in figs:
-        # gera imagem PNG do plotly (kaleido)
-        img_bytes = fig.to_image(format="png", width=1400, height=int(1400*(plot_h/plot_w)))
-        img = ImageReader(io.BytesIO(img_bytes))
-
-        if i % 2 == 0:
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(MARGIN, PAGE_H - MARGIN + 5, "Relatório Folha — " + datetime.now().strftime("%d/%m/%Y %H:%M"))
-        # título do gráfico
-        c.setFont("Helvetica", 11)
-        c.drawString(MARGIN, y_slots[i % 2] + plot_h + 6, title)
-        # imagem
-        c.drawImage(img, MARGIN, y_slots[i % 2], width=plot_w, height=plot_h, preserveAspectRatio=True, mask='auto')
-
-        if i % 2 == 1:
-            c.showPage()
-        i += 1
-
-    if i % 2 != 0:
-        c.showPage()
-
-    c.save()
-    buf.seek(0)
-    return buf.read()
-
-# Gera e disponibiliza o PDF
-if st.button("📄 Gerar PDF A4 (relatório atual)"):
-    if not export_figs:
-        st.warning("Sem gráficos para exportar com os filtros atuais.")
-    else:
-        st.session_state["relatorio_pdf"] = build_pdf(export_figs)
-
-if "relatorio_pdf" in st.session_state:
-    st.download_button(
-        "⬇️ Baixar PDF A4",
-        data=st.session_state["relatorio_pdf"],
-        file_name="relatorio_folha_A4.pdf",
-        mime="application/pdf"
+if not PDF_AVAILABLE or not KALEIDO_AVAILABLE:
+    falta = []
+    if not PDF_AVAILABLE: falta.append("reportlab")
+    if not KALEIDO_AVAILABLE: falta.append("kaleido")
+    st.info(
+        "Geração de PDF A4 indisponível. Para habilitar: "
+        + ", ".join(falta)
+        + "  →  pip install --upgrade kaleido==0.2.1 reportlab==3.6.13"
     )
+else:
+    st.caption("Gera um PDF A4 com os gráficos exibidos nas abas acima (visuais e filtros atuais).")
+
+    def build_pdf(figs):
+        PAGE_W, PAGE_H = A4  # 595 x 842 pt
+        MARGIN = 36
+        plot_w = PAGE_W - 2*MARGIN
+        plot_h = 320  # 2 gráficos por página
+
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        c.setTitle("Relatório Folha - A4")
+
+        y_slots = [PAGE_H - MARGIN - plot_h, MARGIN + 10]  # top e bottom
+
+        i = 0
+        for title, fig in figs:
+            # exporta imagem via kaleido
+            img_bytes = fig.to_image(format="png", width=1400, height=int(1400*(plot_h/plot_w)))
+            img = ImageReader(io.BytesIO(img_bytes))
+
+            if i % 2 == 0:
+                c.setFont("Helvetica-Bold", 12)
+                c.drawString(MARGIN, PAGE_H - MARGIN + 5, "Relatório Folha — " + datetime.now().strftime("%d/%m/%Y %H:%M"))
+            c.setFont("Helvetica", 11)
+            c.drawString(MARGIN, y_slots[i % 2] + plot_h + 6, title)
+            c.drawImage(img, MARGIN, y_slots[i % 2], width=plot_w, height=plot_h,
+                        preserveAspectRatio=True, mask='auto')
+            if i % 2 == 1:
+                c.showPage()
+            i += 1
+
+        if i % 2 != 0:
+            c.showPage()
+        c.save()
+        buf.seek(0)
+        return buf.read()
+
+    if st.button("📄 Gerar PDF A4 (relatório atual)"):
+        if not export_figs:
+            st.warning("Sem gráficos para exportar com os filtros atuais.")
+        else:
+            st.session_state["relatorio_pdf"] = build_pdf(export_figs)
+
+    if "relatorio_pdf" in st.session_state:
+        st.download_button(
+            "⬇️ Baixar PDF A4",
+            data=st.session_state["relatorio_pdf"],
+            file_name="relatorio_folha_A4.pdf",
+            mime="application/pdf"
+        )
 
 st.markdown("---")
-st.caption("Δ (delta) = variação. Rankings: ↑ Aumento% e ↓ Redução% só listam casos positivos; quando não houver, exibimos um aviso.")
+st.caption("Δ (delta) = variação. Rankings: ↑ Aumento% e ↓ Redução% só listam casos positivos; quando não houver, aparece um aviso.")
