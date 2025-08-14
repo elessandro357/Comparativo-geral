@@ -3,14 +3,22 @@
 """
 Painel Streamlit para processar "Comparativo geral.xlsx"
 Comparações 2024 x 2025 por secretaria/categoria, KPIs BR, barras lado a lado,
-ranking de Δ% (aumentos e reduções) sem negativos e TOTAL derivado quando faltar.
+ranking de Δ% (aumentos e reduções) com Top N e PDF A4 (com kaleido+reportlab).
+
+Como rodar:
+  pip install --upgrade streamlit pandas numpy plotly openpyxl kaleido reportlab
+  streamlit run app.py
 """
 import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.io as pio
 from datetime import datetime
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 
 # ============== Config ==============
 st.set_page_config(page_title="Folha - Comparativo 2024 x 2025", layout="wide")
@@ -180,7 +188,7 @@ cat_sel   = st.sidebar.multiselect("Categoria", cat_opts, default=cat_opts)
 year_sel  = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_rng = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
-# Cálculo do total
+# Cálculo do total (quando existirem colunas Total no Excel)
 if has_total_cols:
     total_mode = st.sidebar.radio(
         "Cálculo do TOTAL",
@@ -191,12 +199,13 @@ else:
     total_mode = "Somar categorias selecionadas"
     st.sidebar.info("Colunas 'Total' ausentes. O total será calculado pela soma das categorias.")
 
-# Escala + Toggles
+# Escala + Toggles + Top N
 scale_name = st.sidebar.selectbox("Escala do eixo Y", ["Reais (R$)", "Mil (R$ mil)", "Milhões (R$ mi)"], index=0)
 scale_map  = {"Reais (R$)":(1.0,"R$"), "Mil (R$ mil)":(1e3,"R$ mil"), "Milhões (R$ mi)":(1e6,"R$ mi")}
 scale_div, scale_label = scale_map[scale_name]
 show_labels = st.sidebar.checkbox("Mostrar rótulos de valores nos gráficos", value=False)
 equal_axes  = st.sidebar.checkbox("Fixar eixos iguais nos painéis duplos", value=True)
+top_n_rank  = st.sidebar.number_input("Top N do ranking (mês a mês)", min_value=3, max_value=20, value=5, step=1)
 
 # ============== Base filtrada ==============
 base_mask = (
@@ -204,13 +213,15 @@ base_mask = (
     fact["year"].isin(year_sel) &
     fact["date"].dt.month.between(month_rng[0], month_rng[1])
 )
-fbase = fact.loc[base_mask].copy()
+fbase = fact.loc[base_mask].copy()   # NÃO filtra por categoria aqui
 
 def make_total_df(df, selected_categories, mode, has_tot):
     if mode.startswith("Usar coluna 'Total'") and has_tot:
         out = df[df["category"] == TOT_LABEL].copy()
     else:
         cats = [c for c in selected_categories if c != TOT_LABEL]
+        if not cats:  # se usuário não selecionou base nenhuma, usa todas
+            cats = BASE_CATEGORIES
         out  = df[df["category"].isin(cats)].copy()
     out["value_scaled"] = out["value"] / scale_div
     return out
@@ -244,6 +255,9 @@ def compact_layout(fig, height=320):
 def label_value():
     return f"Valor ({scale_label})" if scale_label != "R$" else "Valor (R$)"
 
+# Lista de figuras para exportação em PDF
+export_figs = []
+
 # ============== Abas ==============
 tabA, tabB, tabC = st.tabs([
     "Comparação por Secretaria (Mês a mês)",
@@ -253,7 +267,7 @@ tabA, tabB, tabC = st.tabs([
 
 # ---------- TAB A: Comparação por Secretaria (mês a mês) ----------
 with tabA:
-    st.caption("Escolha um mês e compare 2024 x 2025 por secretaria (TOTAL). Ranking exibe ↑ aumentos e ↓ reduções (percentuais positivos).")
+    st.caption("Escolha um mês e compare 2024 x 2025 por secretaria (TOTAL). Ranking mostra ↑ aumentos e ↓ reduções (percentuais positivos).")
     meses_disponiveis = sorted(set(range(month_rng[0], month_rng[1]+1)))
     mes_sel = st.selectbox("Mês", options=meses_disponiveis, format_func=month_label, index=0)
 
@@ -280,6 +294,7 @@ with tabA:
                                  cliponaxis=False)
             if ymax: fig_24.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig_24, 380), use_container_width=True)
+            export_figs.append((fig_24.layout.title.text, fig_24))
         with col2:
             fig_25 = px.bar(y25.sort_values("value_scaled", ascending=False),
                             x="secretaria", y="value_scaled",
@@ -290,24 +305,24 @@ with tabA:
                                  cliponaxis=False)
             if ymax: fig_25.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig_25, 380), use_container_width=True)
+            export_figs.append((fig_25.layout.title.text, fig_25))
 
         # ===== Ranking Δ% do mês (sem negativos) =====
         cmp = (y24.rename(columns={"value":"v24"})[["secretaria","v24"]]
                    .merge(y25.rename(columns={"value":"v25"})[["secretaria","v25"]], on="secretaria", how="outer")
                    .fillna(0.0))
-        # aumentos: (2025-2024)/2024  -> positivos
+        # aumentos: (2025-2024)/2024 (positivos)
         cmp["aumento_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v25"]-cmp["v24"])/cmp["v24"])
-        # reduções: (2024-2025)/2024  -> positivos
+        # reduções: (2024-2025)/2024 (positivos)
         cmp["reducao_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v24"]-cmp["v25"])/cmp["v24"])
+        cmp["Δ (R$)"]       = cmp["v25"] - cmp["v24"]
 
-        cmp["Δ (R$)"] = cmp["v25"] - cmp["v24"]
-
-        # Tabelas só com positivos; se vazio, mostra aviso
         colA, colB = st.columns(2)
+        up = cmp[(cmp["aumento_pct"]>0)].sort_values("aumento_pct", ascending=False).head(int(top_n_rank))
+        down = cmp[(cmp["reducao_pct"]>0)].sort_values("reducao_pct", ascending=False).head(int(top_n_rank))
 
-        up = cmp[(cmp["aumento_pct"]>0)].sort_values("aumento_pct", ascending=False).head(5)
         if up.empty:
-            colA.info(f"Sem aumentos em {month_label(mes_sel)} para o filtro atual.")
+            colA.info(f"Sem aumentos em {month_label(mes_sel)}.")
         else:
             up_fmt = up.copy()
             up_fmt["2024"] = up_fmt["v24"].apply(br_currency)
@@ -318,9 +333,8 @@ with tabA:
             colA.dataframe(up_fmt.set_index("secretaria")[["2024","2025","Δ (R$)","Aumento (%)"]],
                            use_container_width=True)
 
-        down = cmp[(cmp["reducao_pct"]>0)].sort_values("reducao_pct", ascending=False).head(5)
         if down.empty:
-            colB.info(f"Sem reduções em {month_label(mes_sel)} para o filtro atual.")
+            colB.info(f"Sem reduções em {month_label(mes_sel)}.")
         else:
             down_fmt = down.copy()
             down_fmt["2024"] = down_fmt["v24"].apply(br_currency)
@@ -356,6 +370,7 @@ with tabB:
                                 cliponaxis=False)
             if ymax: fig2a.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig2a, 380), use_container_width=True)
+            export_figs.append((fig2a.layout.title.text, fig2a))
         with c2:
             fig2b = px.bar(sec25.sort_values("value_scaled", ascending=False),
                            x="secretaria", y="value_scaled",
@@ -366,27 +381,26 @@ with tabB:
                                 cliponaxis=False)
             if ymax: fig2b.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig2b, 380), use_container_width=True)
+            export_figs.append((fig2b.layout.title.text, fig2b))
 
 # ---------- TAB C: Por Categoria (Soma) ----------
 with tabC:
     st.caption("Totais do período filtrado por categoria **incluindo o Total calculado**, com painéis independentes para 2024 e 2025.")
-    # Base desta aba: respeita filtros de secretaria/ano/mês, mas **ignora** o filtro por categoria do sidebar
     base_cat_all = fbase.copy()
 
     if base_cat_all.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        # Remove linhas 'Total' (vamos recalcular)
+        # Remove 'Total' (vamos recalcular)
         base_no_total = base_cat_all[base_cat_all["category"] != TOT_LABEL].copy()
 
-        # Se o usuário selecionou algumas categorias base no sidebar, o total será a soma **dessas** escolhidas; se não, soma todas.
+        # Se o usuário selecionou algumas categorias base no sidebar, o total será a soma **dessas**; se não, soma todas.
         selected_base = [c for c in BASE_CATEGORIES if c in cat_sel]
         use_for_cats = base_no_total[base_no_total["category"].isin(selected_base)] if selected_base else base_no_total
 
         # Somatórios por categoria e por ano
         cat_by_year = use_for_cats.groupby(["year","category"], as_index=False)["value"].sum()
-
-        # TOTAL calculado por ano (soma das categorias usadas)
+        # TOTAL calculado por ano
         total_by_year = use_for_cats.groupby("year", as_index=False)["value"].sum().assign(category=TOT_LABEL)
 
         cat_all = pd.concat([cat_by_year, total_by_year], ignore_index=True)
@@ -414,6 +428,7 @@ with tabC:
                                 cliponaxis=False)
             if ymax: fig3a.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig3a, 380), use_container_width=True)
+            export_figs.append((fig3a.layout.title.text, fig3a))
 
         with c2:
             d25 = cat_all[cat_all["year"]==2025].sort_values("value_scaled", ascending=False)
@@ -425,6 +440,66 @@ with tabC:
                                 cliponaxis=False)
             if ymax: fig3b.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig3b, 380), use_container_width=True)
+            export_figs.append((fig3b.layout.title.text, fig3b))
+
+# ============== PDF A4 ==============
+st.markdown("---")
+st.subheader("📄 Relatório A4")
+st.caption("Gera um PDF A4 com os gráficos exibidos nas abas acima (visuais e filtros atuais).")
+
+def build_pdf(figs):
+    # Tamanhos A4
+    PAGE_W, PAGE_H = A4  # 595 x 842 pt
+    MARGIN = 36         # 0.5"
+    plot_w = PAGE_W - 2*MARGIN
+    plot_h = 320        # cabe 2 gráficos por página
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setTitle("Relatório Folha - A4")
+
+    y_slots = [PAGE_H - MARGIN - plot_h, MARGIN + 10]  # top e bottom
+
+    i = 0
+    for title, fig in figs:
+        # gera imagem PNG do plotly (kaleido)
+        img_bytes = fig.to_image(format="png", width=1400, height=int(1400*(plot_h/plot_w)))
+        img = ImageReader(io.BytesIO(img_bytes))
+
+        if i % 2 == 0:
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(MARGIN, PAGE_H - MARGIN + 5, "Relatório Folha — " + datetime.now().strftime("%d/%m/%Y %H:%M"))
+        # título do gráfico
+        c.setFont("Helvetica", 11)
+        c.drawString(MARGIN, y_slots[i % 2] + plot_h + 6, title)
+        # imagem
+        c.drawImage(img, MARGIN, y_slots[i % 2], width=plot_w, height=plot_h, preserveAspectRatio=True, mask='auto')
+
+        if i % 2 == 1:
+            c.showPage()
+        i += 1
+
+    if i % 2 != 0:
+        c.showPage()
+
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+# Gera e disponibiliza o PDF
+if st.button("📄 Gerar PDF A4 (relatório atual)"):
+    if not export_figs:
+        st.warning("Sem gráficos para exportar com os filtros atuais.")
+    else:
+        st.session_state["relatorio_pdf"] = build_pdf(export_figs)
+
+if "relatorio_pdf" in st.session_state:
+    st.download_button(
+        "⬇️ Baixar PDF A4",
+        data=st.session_state["relatorio_pdf"],
+        file_name="relatorio_folha_A4.pdf",
+        mime="application/pdf"
+    )
 
 st.markdown("---")
 st.caption("Δ (delta) = variação. Rankings: ↑ Aumento% e ↓ Redução% só listam casos positivos; quando não houver, exibimos um aviso.")
