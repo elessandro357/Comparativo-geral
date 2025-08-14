@@ -3,7 +3,7 @@
 """
 Painel Streamlit para processar "Comparativo geral.xlsx"
 Comparações 2024 x 2025 por secretaria/categoria, KPIs BR, barras lado a lado,
-ranking de Δ% sem negativos e TOTAL derivado quando faltar no Excel.
+ranking de Δ% (aumentos e reduções) sem negativos e TOTAL derivado quando faltar.
 """
 import io
 import numpy as np
@@ -180,7 +180,7 @@ cat_sel   = st.sidebar.multiselect("Categoria", cat_opts, default=cat_opts)
 year_sel  = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_rng = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
-# Cálculo do total (se houver colunas Total no Excel, pode usar; senão sempre soma categorias)
+# Cálculo do total
 if has_total_cols:
     total_mode = st.sidebar.radio(
         "Cálculo do TOTAL",
@@ -253,7 +253,7 @@ tabA, tabB, tabC = st.tabs([
 
 # ---------- TAB A: Comparação por Secretaria (mês a mês) ----------
 with tabA:
-    st.caption("Escolha um mês e compare 2024 x 2025 por secretaria (TOTAL). Ranking mostra ↑ aumentos e ↓ reduções **sem negativos** (percentuais positivos).")
+    st.caption("Escolha um mês e compare 2024 x 2025 por secretaria (TOTAL). Ranking exibe ↑ aumentos e ↓ reduções (percentuais positivos).")
     meses_disponiveis = sorted(set(range(month_rng[0], month_rng[1]+1)))
     mes_sel = st.selectbox("Mês", options=meses_disponiveis, format_func=month_label, index=0)
 
@@ -272,22 +272,22 @@ with tabA:
         ymax = max(y24["value_scaled"].max(), y25["value_scaled"].max()) * 1.1 if equal_axes else None
         with col1:
             fig_24 = px.bar(y24.sort_values("value_scaled", ascending=False),
-                            x="secretaria", y="value_scaled", custom_data=["valor_br"],
+                            x="secretaria", y="value_scaled",
                             labels={"value_scaled": label_value(), "secretaria":"Secretaria"},
-                            title=f"{month_label(mes_sel)} / 2024 — Total")
-            fig_24.update_traces(hovertemplate="Valor: %{customdata[0]}<extra></extra>",
-                                 texttemplate="%{customdata[0]}" if show_labels else None,
-                                 textposition="outside" if show_labels else "none", cliponaxis=False)
+                            title=f"{month_label(mes_sel)} / 2024 — Total",
+                            text="valor_br" if show_labels else None)
+            fig_24.update_traces(hovertemplate="Valor: %{text}<extra></extra>" if show_labels else None,
+                                 cliponaxis=False)
             if ymax: fig_24.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig_24, 380), use_container_width=True)
         with col2:
             fig_25 = px.bar(y25.sort_values("value_scaled", ascending=False),
-                            x="secretaria", y="value_scaled", custom_data=["valor_br"],
+                            x="secretaria", y="value_scaled",
                             labels={"value_scaled": label_value(), "secretaria":"Secretaria"},
-                            title=f"{month_label(mes_sel)} / 2025 — Total")
-            fig_25.update_traces(hovertemplate="Valor: %{customdata[0]}<extra></extra>",
-                                 texttemplate="%{customdata[0]}" if show_labels else None,
-                                 textposition="outside" if show_labels else "none", cliponaxis=False)
+                            title=f"{month_label(mes_sel)} / 2025 — Total",
+                            text="valor_br" if show_labels else None)
+            fig_25.update_traces(hovertemplate="Valor: %{text}<extra></extra>" if show_labels else None,
+                                 cliponaxis=False)
             if ymax: fig_25.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig_25, 380), use_container_width=True)
 
@@ -295,31 +295,41 @@ with tabA:
         cmp = (y24.rename(columns={"value":"v24"})[["secretaria","v24"]]
                    .merge(y25.rename(columns={"value":"v25"})[["secretaria","v25"]], on="secretaria", how="outer")
                    .fillna(0.0))
-        # aumentos: (2025-2024)/2024  -> valores positivos
-        cmp["aumento_pct"]  = np.where(cmp["v24"]==0, np.nan, np.maximum((cmp["v25"]-cmp["v24"])/cmp["v24"], 0))
-        # reduções: (2024-2025)/2024  -> valores positivos
-        cmp["reducao_pct"]  = np.where(cmp["v24"]==0, np.nan, np.maximum((cmp["v24"]-cmp["v25"])/cmp["v24"], 0))
-        cmp["Δ (R$)"]       = cmp["v25"] - cmp["v24"]
+        # aumentos: (2025-2024)/2024  -> positivos
+        cmp["aumento_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v25"]-cmp["v24"])/cmp["v24"])
+        # reduções: (2024-2025)/2024  -> positivos
+        cmp["reducao_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v24"]-cmp["v25"])/cmp["v24"])
 
-        # Formatado para exibir
-        cmp_fmt = cmp.copy()
-        cmp_fmt["2024"] = cmp_fmt["v24"].apply(br_currency)
-        cmp_fmt["2025"] = cmp_fmt["v25"].apply(br_currency)
-        cmp_fmt["Δ (R$)"] = cmp_fmt["Δ (R$)"].apply(br_currency)
-        cmp_fmt["Aumento (%)"] = cmp_fmt["aumento_pct"].apply(lambda x: br_percent(x) if pd.notna(x) else "-")
-        cmp_fmt["Redução (%)"] = cmp_fmt["reducao_pct"].apply(lambda x: br_percent(x) if pd.notna(x) else "-")
+        cmp["Δ (R$)"] = cmp["v25"] - cmp["v24"]
 
+        # Tabelas só com positivos; se vazio, mostra aviso
         colA, colB = st.columns(2)
-        up = cmp.dropna(subset=["aumento_pct"]).sort_values("aumento_pct", ascending=False).head(5)
-        down = cmp.dropna(subset=["reducao_pct"]).sort_values("reducao_pct", ascending=False).head(5)
-        colA.markdown(f"**Top ↑ Aumentos (Aumento %) — {month_label(mes_sel)}**")
-        colA.dataframe(cmp_fmt.set_index("secretaria")
-                       .loc[up["secretaria"], ["2024","2025","Δ (R$)","Aumento (%)"]],
-                       use_container_width=True)
-        colB.markdown(f"**Top ↓ Reduções (Redução %) — {month_label(mes_sel)}**")
-        colB.dataframe(cmp_fmt.set_index("secretaria")
-                       .loc[down["secretaria"], ["2024","2025","Δ (R$)","Redução (%)"]],
-                       use_container_width=True)
+
+        up = cmp[(cmp["aumento_pct"]>0)].sort_values("aumento_pct", ascending=False).head(5)
+        if up.empty:
+            colA.info(f"Sem aumentos em {month_label(mes_sel)} para o filtro atual.")
+        else:
+            up_fmt = up.copy()
+            up_fmt["2024"] = up_fmt["v24"].apply(br_currency)
+            up_fmt["2025"] = up_fmt["v25"].apply(br_currency)
+            up_fmt["Δ (R$)"] = up_fmt["Δ (R$)"].apply(br_currency)
+            up_fmt["Aumento (%)"] = up_fmt["aumento_pct"].apply(br_percent)
+            colA.markdown(f"**Top ↑ Aumentos — {month_label(mes_sel)}**")
+            colA.dataframe(up_fmt.set_index("secretaria")[["2024","2025","Δ (R$)","Aumento (%)"]],
+                           use_container_width=True)
+
+        down = cmp[(cmp["reducao_pct"]>0)].sort_values("reducao_pct", ascending=False).head(5)
+        if down.empty:
+            colB.info(f"Sem reduções em {month_label(mes_sel)} para o filtro atual.")
+        else:
+            down_fmt = down.copy()
+            down_fmt["2024"] = down_fmt["v24"].apply(br_currency)
+            down_fmt["2025"] = down_fmt["v25"].apply(br_currency)
+            down_fmt["Δ (R$)"] = down_fmt["Δ (R$)"].apply(br_currency)
+            down_fmt["Redução (%)"] = down_fmt["reducao_pct"].apply(br_percent)
+            colB.markdown(f"**Top ↓ Reduções — {month_label(mes_sel)}**")
+            colB.dataframe(down_fmt.set_index("secretaria")[["2024","2025","Δ (R$)","Redução (%)"]],
+                           use_container_width=True)
 
 # ---------- TAB B: Por Secretaria (Soma) ----------
 with tabB:
@@ -338,51 +348,53 @@ with tabB:
         ymax = max(sec24["value_scaled"].max(), sec25["value_scaled"].max()) * 1.1 if equal_axes else None
         with c1:
             fig2a = px.bar(sec24.sort_values("value_scaled", ascending=False),
-                           x="secretaria", y="value_scaled", custom_data=["valor_br"],
+                           x="secretaria", y="value_scaled",
                            labels={"value_scaled": label_value(), "secretaria":"Secretaria"},
-                           title="Soma por Secretaria — 2024")
-            fig2a.update_traces(hovertemplate="Valor: %{customdata[0]}<extra></extra>",
-                                texttemplate="%{customdata[0]}" if show_labels else None,
-                                textposition="outside" if show_labels else "none", cliponaxis=False)
+                           title="Soma por Secretaria — 2024",
+                           text="valor_br" if show_labels else None)
+            fig2a.update_traces(hovertemplate="Valor: %{text}<extra></extra>" if show_labels else None,
+                                cliponaxis=False)
             if ymax: fig2a.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig2a, 380), use_container_width=True)
         with c2:
             fig2b = px.bar(sec25.sort_values("value_scaled", ascending=False),
-                           x="secretaria", y="value_scaled", custom_data=["valor_br"],
+                           x="secretaria", y="value_scaled",
                            labels={"value_scaled": label_value(), "secretaria":"Secretaria"},
-                           title="Soma por Secretaria — 2025")
-            fig2b.update_traces(hovertemplate="Valor: %{customdata[0]}<extra></extra>",
-                                texttemplate="%{customdata[0]}" if show_labels else None,
-                                textposition="outside" if show_labels else "none", cliponaxis=False)
+                           title="Soma por Secretaria — 2025",
+                           text="valor_br" if show_labels else None)
+            fig2b.update_traces(hovertemplate="Valor: %{text}<extra></extra>" if show_labels else None,
+                                cliponaxis=False)
             if ymax: fig2b.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig2b, 380), use_container_width=True)
 
 # ---------- TAB C: Por Categoria (Soma) ----------
 with tabC:
     st.caption("Totais do período filtrado por categoria **incluindo o Total calculado**, com painéis independentes para 2024 e 2025.")
-    # Para esta aba: respeita filtros de secretaria/ano/mês, mas ignora 'cat_sel'
-    base_cat = fbase[fbase["category"] != TOT_LABEL].copy()
+    # Base desta aba: respeita filtros de secretaria/ano/mês, mas **ignora** o filtro por categoria do sidebar
+    base_cat_all = fbase.copy()
 
-    if base_cat.empty:
+    if base_cat_all.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        # Se o usuário marcou categorias específicas, limita as barras; TOTAL soma o que estiver selecionado (ou todas se nada escolhido além de 'Total').
-        selected_base = [c for c in BASE_CATEGORIES if c in cat_sel]
-        use_for_cats = base_cat[base_cat["category"].isin(selected_base)] if selected_base else base_cat
+        # Remove linhas 'Total' (vamos recalcular)
+        base_no_total = base_cat_all[base_cat_all["category"] != TOT_LABEL].copy()
 
-        # Somatórios por categoria e por ano (para barras)
+        # Se o usuário selecionou algumas categorias base no sidebar, o total será a soma **dessas** escolhidas; se não, soma todas.
+        selected_base = [c for c in BASE_CATEGORIES if c in cat_sel]
+        use_for_cats = base_no_total[base_no_total["category"].isin(selected_base)] if selected_base else base_no_total
+
+        # Somatórios por categoria e por ano
         cat_by_year = use_for_cats.groupby(["year","category"], as_index=False)["value"].sum()
 
-        # TOTAL calculado: soma das categorias presentes em 'use_for_cats' por ano
+        # TOTAL calculado por ano (soma das categorias usadas)
         total_by_year = use_for_cats.groupby("year", as_index=False)["value"].sum().assign(category=TOT_LABEL)
 
         cat_all = pd.concat([cat_by_year, total_by_year], ignore_index=True)
 
-        # Garante presença de todas as categorias base + Total em ambos os anos
+        # Garante presença de todas as categorias + Total em 2024 e 2025
         for y in [2024, 2025]:
-            present = set(cat_all.loc[cat_all["year"]==y, "category"])
-            for c in BASE_CATEGORIES + [TOT_LABEL]:
-                if c not in present:
+            for c in ALL_CATEGORIES:
+                if not ((cat_all["year"]==y) & (cat_all["category"]==c)).any():
                     cat_all = pd.concat([cat_all, pd.DataFrame({"year":[y], "category":[c], "value":[0.0]})], ignore_index=True)
 
         cat_all["value_scaled"] = cat_all["value"]/scale_div
@@ -394,25 +406,25 @@ with tabC:
 
         with c1:
             d24 = cat_all[cat_all["year"]==2024].sort_values("value_scaled", ascending=False)
-            fig3a = px.bar(d24, x="category", y="value_scaled", custom_data=["valor_br"],
+            fig3a = px.bar(d24, x="category", y="value_scaled",
                            labels={"value_scaled": label_value(), "category":"Categoria"},
-                           title="Soma por Categoria — 2024")
-            fig3a.update_traces(hovertemplate="Valor: %{customdata[0]}<extra></extra>",
-                                texttemplate="%{customdata[0]}" if show_labels else None,
-                                textposition="outside" if show_labels else "none", cliponaxis=False)
+                           title="Soma por Categoria — 2024",
+                           text="valor_br" if show_labels else None)
+            fig3a.update_traces(hovertemplate="Valor: %{text}<extra></extra>" if show_labels else None,
+                                cliponaxis=False)
             if ymax: fig3a.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig3a, 380), use_container_width=True)
 
         with c2:
             d25 = cat_all[cat_all["year"]==2025].sort_values("value_scaled", ascending=False)
-            fig3b = px.bar(d25, x="category", y="value_scaled", custom_data=["valor_br"],
+            fig3b = px.bar(d25, x="category", y="value_scaled",
                            labels={"value_scaled": label_value(), "category":"Categoria"},
-                           title="Soma por Categoria — 2025")
-            fig3b.update_traces(hovertemplate="Valor: %{customdata[0]}<extra></extra>",
-                                texttemplate="%{customdata[0]}" if show_labels else None,
-                                textposition="outside" if show_labels else "none", cliponaxis=False)
+                           title="Soma por Categoria — 2025",
+                           text="valor_br" if show_labels else None)
+            fig3b.update_traces(hovertemplate="Valor: %{text}<extra></extra>" if show_labels else None,
+                                cliponaxis=False)
             if ymax: fig3b.update_yaxes(range=[0, ymax])
             st.plotly_chart(compact_layout(fig3b, 380), use_container_width=True)
 
 st.markdown("---")
-st.caption("Δ (delta) = variação. Nos rankings: ↑ mostra **aumento%** e ↓ **redução%** sempre positivos.")
+st.caption("Δ (delta) = variação. Rankings: ↑ Aumento% e ↓ Redução% só listam casos positivos; quando não houver, exibimos um aviso.")
