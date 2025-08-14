@@ -4,7 +4,7 @@
 Painel Streamlit para processar "Comparativo geral.xlsx"
 Comparações 2024 x 2025 por secretaria/categoria, KPIs BR, barras lado a lado,
 ranking de Δ% (aumentos e reduções) com Top N e exportação A4 em HTML imprimível
-(sem dependências nativas como reportlab/kaleido).
+(sem reportlab/kaleido).
 """
 import io
 import numpy as np
@@ -61,12 +61,6 @@ def month_label(m:int) -> str:
     except Exception:
         return str(m)
 
-def safe_selectbox(label, options, key=None):
-    if not options:
-        st.warning(f"Não há opções para '{label}'. Verifique os filtros/dados.")
-        return None
-    return st.selectbox(label, options=options, index=0, key=key)
-
 def ensure_all_secs(df, all_secs):
     present = set(df["secretaria"])
     missing = [s for s in all_secs if s not in present]
@@ -107,7 +101,7 @@ def transform_excel(file_bytes: bytes):
     rows = []
     for _, r in df.iterrows():
         m = r["MesIndex"]
-        if pd.isna(m):
+        if pd.isna(m): 
             continue
         for cat in BASE_CATEGORIES:
             c24, c25 = cols_2024.get(cat), cols_2025.get(cat)
@@ -132,7 +126,7 @@ def transform_excel(file_bytes: bytes):
     # TOTAL derivado quando não existir no Excel
     if not has_total_cols:
         base_only = fact[fact["category"].isin(BASE_CATEGORIES)].copy()
-        totals = (base_only.groupby(["secretaria","date","year"], as_index=False)["value"].sum()
+        totals = (base_only.groupby(["secretaria","date","year"], as_index=False, observed=False)["value"].sum()
                             .assign(category=TOT_LABEL))
         fact = pd.concat([fact, totals], ignore_index=True)
 
@@ -143,7 +137,8 @@ def transform_excel(file_bytes: bytes):
                 .sort_values("date"))
     dim_secretaria = fact[["secretaria"]].drop_duplicates().sort_values("secretaria")
 
-    comp = (fact.pivot_table(index=["secretaria","date","category"], columns="year", values="value", aggfunc="sum")
+    comp = (fact.pivot_table(index=["secretaria","date","category"], columns="year",
+                             values="value", aggfunc="sum", observed=False)
                  .reset_index().rename_axis(None, axis=1)
                  .rename(columns={2024:"value_2024", 2025:"value_2025"}))
     comp["value_2024_f"] = comp["value_2024"].fillna(0.0)
@@ -269,8 +264,8 @@ with tabA:
         st.info("Sem dados para o mês selecionado dentro do filtro.")
     else:
         all_secs = sorted(base_mes["secretaria"].unique().tolist())
-        y24 = (base_mes[base_mes["year"]==2024].groupby("secretaria", as_index=False)["value"].sum())
-        y25 = (base_mes[base_mes["year"]==2025].groupby("secretaria", as_index=False)["value"].sum())
+        y24 = (base_mes[base_mes["year"]==2024].groupby("secretaria", as_index=False, observed=False)["value"].sum())
+        y25 = (base_mes[base_mes["year"]==2025].groupby("secretaria", as_index=False, observed=False)["value"].sum())
         y24 = ensure_all_secs(y24, all_secs); y25 = ensure_all_secs(y25, all_secs)
         y24["value_scaled"] = y24["value"]/scale_div; y25["value_scaled"] = y25["value"]/scale_div
         y24["valor_br"] = y24["value"].apply(br_currency); y25["valor_br"] = y25["value"].apply(br_currency)
@@ -343,8 +338,8 @@ with tabB:
         st.info("Sem dados para os filtros selecionados.")
     else:
         all_secs = sorted(filt_tot["secretaria"].unique().tolist())
-        sec24 = (filt_tot[filt_tot["year"]==2024].groupby("secretaria", as_index=False)["value"].sum())
-        sec25 = (filt_tot[filt_tot["year"]==2025].groupby("secretaria", as_index=False)["value"].sum())
+        sec24 = (filt_tot[filt_tot["year"]==2024].groupby("secretaria", as_index=False, observed=False)["value"].sum())
+        sec25 = (filt_tot[filt_tot["year"]==2025].groupby("secretaria", as_index=False, observed=False)["value"].sum())
         sec24 = ensure_all_secs(sec24, all_secs); sec25 = ensure_all_secs(sec25, all_secs)
         sec24["value_scaled"] = sec24["value"]/scale_div; sec25["value_scaled"] = sec25["value"]/scale_div
         sec24["valor_br"] = sec24["value"].apply(br_currency); sec25["valor_br"] = sec25["value"].apply(br_currency)
@@ -387,8 +382,8 @@ with tabC:
         selected_base = [c for c in BASE_CATEGORIES if c in cat_sel]
         use_for_cats = base_no_total[base_no_total["category"].isin(selected_base)] if selected_base else base_no_total
 
-        cat_by_year = use_for_cats.groupby(["year","category"], as_index=False)["value"].sum()
-        total_by_year = use_for_cats.groupby("year", as_index=False)["value"].sum().assign(category=TOT_LABEL)
+        cat_by_year = use_for_cats.groupby(["year","category"], as_index=False, observed=False)["value"].sum()
+        total_by_year = use_for_cats.groupby("year", as_index=False, observed=False)["value"].sum().assign(category=TOT_LABEL)
 
         cat_all = pd.concat([cat_by_year, total_by_year], ignore_index=True)
 
@@ -431,7 +426,7 @@ with tabC:
 # ============== A4 HTML (Imprimir/Salvar) ==============
 st.markdown("---")
 st.subheader("🖨️ A4 – Imprimir ou Salvar")
-st.caption("Gera uma página A4 com os gráficos exibidos (visuais e filtros atuais). Abra e use **Ctrl/Cmd+P** para salvar em PDF.")
+st.caption("Gera uma página A4 com os gráficos exibidos (visuais e filtros atuais). Abra e use Ctrl/Cmd+P para salvar em PDF.")
 
 def build_a4_html(figs, titulo, subtitulo):
     parts = []
@@ -469,7 +464,6 @@ def build_a4_html(figs, titulo, subtitulo):
 </body></html>"""
     return html.encode("utf-8")
 
-# monta título/subtítulo dinâmicos
 periodo = f"{month_label(month_rng[0])}–{month_label(month_rng[1])}"
 anos = " & ".join(map(str, year_sel))
 subtitulo = f"Período: {periodo} | Anos: {anos} | Escala: {scale_label} | Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
