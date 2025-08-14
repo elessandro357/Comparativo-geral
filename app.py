@@ -3,10 +3,8 @@
 """
 Painel Streamlit para processar "Comparativo geral.xlsx"
 Comparações 2024 x 2025 por secretaria/categoria, KPIs BR, barras lado a lado,
-ranking de Δ% (aumentos e reduções) com Top N e exportação PDF A4 opcional.
-
-Para PDF A4 (opcional):
-  pip install --upgrade kaleido==0.2.1 reportlab==3.6.13
+ranking de Δ% (aumentos e reduções) com Top N e exportação A4 em HTML imprimível
+(sem dependências nativas como reportlab/kaleido).
 """
 import io
 import numpy as np
@@ -15,21 +13,6 @@ import streamlit as st
 import plotly.express as px
 import plotly.io as pio
 from datetime import datetime
-
-# ==== Dependências de PDF (opcionais e não bloqueantes) ====
-try:
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.utils import ImageReader
-    PDF_AVAILABLE = True
-except Exception:
-    PDF_AVAILABLE = False
-
-try:
-    import kaleido  # usado pelo Plotly para exportar imagens
-    KALEIDO_AVAILABLE = True
-except Exception:
-    KALEIDO_AVAILABLE = False
 
 # ============== Config ==============
 st.set_page_config(page_title="Folha - Comparativo 2024 x 2025", layout="wide")
@@ -98,7 +81,6 @@ def transform_excel(file_bytes: bytes):
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0)
     df.columns = df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
 
-    # Localiza colunas-chave
     sec_col = next((c for c in df.columns if c.lower().startswith("secretaria")), None)
     mes_col = next((c for c in df.columns if c.replace(" ","") in {"Mês/Ano","Mes/Ano"}), None)
     if sec_col is None or mes_col is None:
@@ -125,7 +107,7 @@ def transform_excel(file_bytes: bytes):
     rows = []
     for _, r in df.iterrows():
         m = r["MesIndex"]
-        if pd.isna(m): 
+        if pd.isna(m):
             continue
         for cat in BASE_CATEGORIES:
             c24, c25 = cols_2024.get(cat), cols_2025.get(cat)
@@ -199,7 +181,7 @@ cat_sel   = st.sidebar.multiselect("Categoria", cat_opts, default=cat_opts)
 year_sel  = st.sidebar.multiselect("Ano", year_opts, default=year_opts)
 month_rng = st.sidebar.slider("Mês (1=Jan ... 12=Dez)", 1, 12, (month_min, month_max))
 
-# Cálculo do total (quando existirem colunas Total no Excel)
+# Cálculo do total
 if has_total_cols:
     total_mode = st.sidebar.radio(
         "Cálculo do TOTAL",
@@ -266,7 +248,7 @@ def compact_layout(fig, height=320):
 def label_value():
     return f"Valor ({scale_label})" if scale_label != "R$" else "Valor (R$)"
 
-# Lista de figuras para exportação em PDF
+# Lista de figuras para exportação A4
 export_figs = []
 
 # ============== Abas ==============
@@ -322,9 +304,7 @@ with tabA:
         cmp = (y24.rename(columns={"value":"v24"})[["secretaria","v24"]]
                    .merge(y25.rename(columns={"value":"v25"})[["secretaria","v25"]], on="secretaria", how="outer")
                    .fillna(0.0))
-        # aumentos: (2025-2024)/2024
         cmp["aumento_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v25"]-cmp["v24"])/cmp["v24"])
-        # reduções: (2024-2025)/2024
         cmp["reducao_pct"]  = np.where(cmp["v24"]==0, np.nan, (cmp["v24"]-cmp["v25"])/cmp["v24"])
         cmp["Δ (R$)"]       = cmp["v25"] - cmp["v24"]
 
@@ -402,21 +382,16 @@ with tabC:
     if base_cat_all.empty:
         st.info("Sem dados para os filtros selecionados.")
     else:
-        # Remove 'Total' (vamos recalcular)
         base_no_total = base_cat_all[base_cat_all["category"] != TOT_LABEL].copy()
 
-        # Se o usuário selecionou algumas categorias base no sidebar, o total será a soma **dessas**; se não, soma todas.
         selected_base = [c for c in BASE_CATEGORIES if c in cat_sel]
         use_for_cats = base_no_total[base_no_total["category"].isin(selected_base)] if selected_base else base_no_total
 
-        # Somatórios por categoria e por ano
         cat_by_year = use_for_cats.groupby(["year","category"], as_index=False)["value"].sum()
-        # TOTAL calculado por ano
         total_by_year = use_for_cats.groupby("year", as_index=False)["value"].sum().assign(category=TOT_LABEL)
 
         cat_all = pd.concat([cat_by_year, total_by_year], ignore_index=True)
 
-        # Garante presença de todas as categorias + Total em 2024 e 2025
         for y in [2024, 2025]:
             for c in ALL_CATEGORIES:
                 if not ((cat_all["year"]==y) & (cat_all["category"]==c)).any():
@@ -453,69 +428,66 @@ with tabC:
             st.plotly_chart(compact_layout(fig3b, 380), use_container_width=True)
             export_figs.append((fig3b.layout.title.text, fig3b))
 
-# ============== PDF A4 ==============
+# ============== A4 HTML (Imprimir/Salvar) ==============
 st.markdown("---")
-st.subheader("📄 Relatório A4")
-if not PDF_AVAILABLE or not KALEIDO_AVAILABLE:
-    falta = []
-    if not PDF_AVAILABLE: falta.append("reportlab")
-    if not KALEIDO_AVAILABLE: falta.append("kaleido")
-    st.info(
-        "Geração de PDF A4 indisponível. Para habilitar: "
-        + ", ".join(falta)
-        + "  →  pip install --upgrade kaleido==0.2.1 reportlab==3.6.13"
+st.subheader("🖨️ A4 – Imprimir ou Salvar")
+st.caption("Gera uma página A4 com os gráficos exibidos (visuais e filtros atuais). Abra e use **Ctrl/Cmd+P** para salvar em PDF.")
+
+def build_a4_html(figs, titulo, subtitulo):
+    parts = []
+    for i, (title, fig) in enumerate(figs):
+        html_fig = pio.to_html(fig, include_plotlyjs=('inline' if i == 0 else False),
+                               full_html=False, config={"displayModeBar": False})
+        parts.append(f"<section class='chart'><h3>{title}</h3>{html_fig}</section>")
+
+    css = """
+    <style>
+      @page { size: A4; margin: 12mm; }
+      html, body { margin:0; padding:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+      header { margin: 6mm 0 4mm 0; }
+      h1 { font-size: 20px; margin: 0; }
+      .sub { color:#555; font-size: 12px; margin-top: 2mm; }
+      .chart { page-break-inside: avoid; break-inside: avoid; margin: 6mm 0; }
+      .printbar { margin: 8px 0 16px 0; }
+      @media print { .no-print { display:none; } }
+    </style>
+    """
+    btn_bar = """
+    <div class="printbar no-print">
+      <button onclick="window.print()" style="padding:8px 12px;font-size:14px;cursor:pointer">Imprimir / Salvar em PDF</button>
+    </div>
+    """
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{titulo}</title>{css}</head>
+<body>
+  <header>
+    <h1>{titulo}</h1>
+    <div class="sub">{subtitulo}</div>
+  </header>
+  {btn_bar}
+  {''.join(parts)}
+</body></html>"""
+    return html.encode("utf-8")
+
+# monta título/subtítulo dinâmicos
+periodo = f"{month_label(month_rng[0])}–{month_label(month_rng[1])}"
+anos = " & ".join(map(str, year_sel))
+subtitulo = f"Período: {periodo} | Anos: {anos} | Escala: {scale_label} | Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+
+if st.button("🖨️ Gerar página A4 (HTML)"):
+    if not export_figs:
+        st.warning("Sem gráficos para exportar com os filtros atuais.")
+    else:
+        st.session_state["a4_html"] = build_a4_html(export_figs, "Relatório Folha – A4", subtitulo)
+
+if "a4_html" in st.session_state:
+    st.download_button(
+        "⬇️ Baixar HTML A4",
+        data=st.session_state["a4_html"],
+        file_name="relatorio_folha_A4.html",
+        mime="text/html"
     )
-else:
-    st.caption("Gera um PDF A4 com os gráficos exibidos nas abas acima (visuais e filtros atuais).")
-
-    def build_pdf(figs):
-        PAGE_W, PAGE_H = A4  # 595 x 842 pt
-        MARGIN = 36
-        plot_w = PAGE_W - 2*MARGIN
-        plot_h = 320  # 2 gráficos por página
-
-        buf = io.BytesIO()
-        c = canvas.Canvas(buf, pagesize=A4)
-        c.setTitle("Relatório Folha - A4")
-
-        y_slots = [PAGE_H - MARGIN - plot_h, MARGIN + 10]  # top e bottom
-
-        i = 0
-        for title, fig in figs:
-            # exporta imagem via kaleido
-            img_bytes = fig.to_image(format="png", width=1400, height=int(1400*(plot_h/plot_w)))
-            img = ImageReader(io.BytesIO(img_bytes))
-
-            if i % 2 == 0:
-                c.setFont("Helvetica-Bold", 12)
-                c.drawString(MARGIN, PAGE_H - MARGIN + 5, "Relatório Folha — " + datetime.now().strftime("%d/%m/%Y %H:%M"))
-            c.setFont("Helvetica", 11)
-            c.drawString(MARGIN, y_slots[i % 2] + plot_h + 6, title)
-            c.drawImage(img, MARGIN, y_slots[i % 2], width=plot_w, height=plot_h,
-                        preserveAspectRatio=True, mask='auto')
-            if i % 2 == 1:
-                c.showPage()
-            i += 1
-
-        if i % 2 != 0:
-            c.showPage()
-        c.save()
-        buf.seek(0)
-        return buf.read()
-
-    if st.button("📄 Gerar PDF A4 (relatório atual)"):
-        if not export_figs:
-            st.warning("Sem gráficos para exportar com os filtros atuais.")
-        else:
-            st.session_state["relatorio_pdf"] = build_pdf(export_figs)
-
-    if "relatorio_pdf" in st.session_state:
-        st.download_button(
-            "⬇️ Baixar PDF A4",
-            data=st.session_state["relatorio_pdf"],
-            file_name="relatorio_folha_A4.pdf",
-            mime="application/pdf"
-        )
+    st.components.v1.html(st.session_state["a4_html"].decode("utf-8"), height=900, scrolling=True)
 
 st.markdown("---")
-st.caption("Δ (delta) = variação. Rankings: ↑ Aumento% e ↓ Redução% só listam casos positivos; quando não houver, aparece um aviso.")
+st.caption("Δ (delta) = variação. Rankings: ↑ Aumento% e ↓ Redução% listam apenas casos positivos; se não houver, mostramos aviso.")
